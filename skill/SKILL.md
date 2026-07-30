@@ -1,8 +1,8 @@
 ---
 name: session-history
-description: "Load when the user asks what was discussed, decided, or seen in an earlier session, or which past session touched a file. Triggers: 'did we discuss', '之前讨论过', '以前是不是', 'have I seen this error', 'last time we'."
+description: "Load when the user asks what was discussed or decided before, references earlier work you lack context for, resumes previous work, or when knowing prior decisions would improve your answer. Triggers: 'did we discuss', '之前讨论过', '继续之前的', 'have I seen this error', 'last time we'."
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
 # Session History
@@ -25,6 +25,34 @@ which fails silently rather than erroring.
 Flags: `-n` limit, `-w` snippet width, `--json`, `--project`, `--session`,
 `--role user|assistant`, `--since YYYY-MM-DD`, `--tool-name`, `--tool-status error`,
 `--with TOKEN` (whole-word prefilter; makes `-l` sub-millisecond), `--no-update`.
+
+## Query without being asked
+
+Search first, do not ask the user to remind you, in these cases:
+
+- The user refers to a decision, plan, or problem as already settled and you have no
+  record of it in this session.
+- The user resumes work: "继续之前的", "continue where we left off", "把那个做完".
+- You are about to change a file with a long history, and the reason for its current
+  shape is not evident from the code.
+- You hit an error whose wording looks like something already encountered.
+- The user's request contradicts what the code does, suggesting an earlier decision you
+  cannot see.
+
+Restraint: one bounded query, then answer. Do not open a session and read it through, and
+do not run this on turns where nothing is being recalled. When a past decision changes
+what you are about to do, say so and cite it.
+
+## Retrieval discipline
+
+Narrow before broadening: `--session` or `--project` or a `tool_calls.path` filter beats a
+bare full-text query when you already know the scope. Empty scoped results are a real
+answer.
+
+Keep output small: `-n` and `-w` exist so synthesis stays cheap. Prefer counts and
+groupings computed in `--sql` over reading many snippets.
+
+Answer with citations (`message_id:content_index`), not with volume.
 
 ## Choosing the corpus
 
