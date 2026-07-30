@@ -24,9 +24,35 @@ EOF
     exit 2
 fi
 
-# Strip comments and blank lines, join into one alternation.
-PAT="$(grep -vE '^\s*(#|$)' "$DENY" | paste -sd'|' -)"
-[ -n "$PAT" ] || { echo "error: deny-list is empty" >&2; exit 2; }
+# Strip comments, trailing whitespace and blank lines.
+mapfile -t TERMS < <(sed -e 's/[[:space:]]*$//' "$DENY" | grep -vE '^([[:space:]]*#|$)')
+[ "${#TERMS[@]}" -gt 0 ] || { echo "error: deny-list is empty" >&2; exit 2; }
+
+# A deny term that matches ordinary vocabulary makes the report useless: every line
+# of every file hits, and a real leak is invisible in the noise. Validate each term
+# against benign controls before scanning. Unanchored product abbreviations are the
+# usual cause -- a short one can appear inside a common word such as "session", which
+# this project mentions constantly.
+CONTROLS='session
+sessions
+kiro-session-index
+message
+process
+assessment
+index
+hello world
+python3 stdlib'
+broad=0
+for t in "${TERMS[@]}"; do
+    if printf '%s\n' "$CONTROLS" | grep -qEi -- "$t" 2>/dev/null; then
+        printf 'error: deny pattern %s matches ordinary text\n' "'$t'" >&2
+        printf '       anchor it, e.g. %s\n' "'\\b${t}\\b'" >&2
+        broad=1
+    fi
+done
+[ "$broad" -eq 0 ] || { echo "refusing to scan with an over-broad deny-list" >&2; exit 2; }
+
+PAT="$(printf '%s|' "${TERMS[@]}")"; PAT="${PAT%|}"
 
 mode="${1:-all}"
 fail=0
