@@ -24,6 +24,9 @@ For usage see [README.md](README.md); for the agent-facing reference see
 
 ## Premise
 
+Borrowed from [obelisk](https://github.com/tommy0103/obelisk) — see Credits in
+[README.md](README.md).
+
 Session JSONL is already a complete, immutable, append-only evidence layer.
 Rather than distilling conversations into facts and letting the originals rot,
 index the originals and query them.
