@@ -149,5 +149,75 @@ class TestSetup(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
 
 
+class TestInvocation(unittest.TestCase):
+    """setup.sh must behave identically however it is started.
+
+    `sh setup.sh` bypasses the shebang, and /bin/sh is dash on this system: it has no
+    `set -o pipefail` and no ${BASH_SOURCE}, so the script re-execs itself under bash.
+    """
+
+    def _install(self, argv):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        skill_dir = os.path.join(tmp.name, "session-history")
+        proc = subprocess.run(
+            argv + ["--skill-dir", skill_dir, "--no-index"],
+            capture_output=True, text=True, cwd=REPO)
+        installed = sorted(
+            os.path.relpath(os.path.join(r, f), skill_dir)
+            for r, _, fs in os.walk(skill_dir) for f in fs)
+        return proc, installed
+
+    def test_sh_invocation_succeeds(self):
+        proc, installed = self._install(["sh", "setup.sh"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("pipefail", proc.stderr)
+        self.assertEqual(sorted(EXPECTED), installed)
+
+    @unittest.skipUnless(shutil.which("dash"), "dash not available")
+    def test_dash_invocation_succeeds(self):
+        proc, installed = self._install(["dash", "setup.sh"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(sorted(EXPECTED), installed)
+
+    def test_bash_invocation_succeeds(self):
+        proc, installed = self._install(["bash", "setup.sh"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(sorted(EXPECTED), installed)
+
+    def test_direct_execution_succeeds(self):
+        proc, installed = self._install([os.path.join(REPO, "setup.sh")])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(sorted(EXPECTED), installed)
+
+    def test_all_shells_produce_identical_installs(self):
+        _, a = self._install(["sh", "setup.sh"])
+        _, b = self._install(["bash", "setup.sh"])
+        self.assertEqual(a, b)
+
+    def test_help_works_under_sh(self):
+        proc = subprocess.run(["sh", "setup.sh", "--help"],
+                              capture_output=True, text=True, cwd=REPO)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--skill-dir", proc.stdout)
+        self.assertIn("--no-index", proc.stdout)
+        self.assertNotIn("#", proc.stdout)  # comment markers stripped
+
+    def test_unknown_option_rejected_under_sh(self):
+        proc = subprocess.run(["sh", "setup.sh", "--nonsense"],
+                              capture_output=True, text=True, cwd=REPO)
+        self.assertEqual(proc.returncode, 2)
+
+    def test_reexec_guard_is_posix_parseable(self):
+        """The guard runs before any bash-only construct, so dash must parse it."""
+        with open(SETUP, encoding="utf8") as fh:
+            lines = fh.read().splitlines()
+        guard = next(i for i, l in enumerate(lines) if "BASH_VERSION" in l)
+        pipefail = next(i for i, l in enumerate(lines) if "pipefail" in l
+                        and l.strip().startswith("set "))
+        self.assertLess(guard, pipefail,
+                        "the bash guard must precede `set -o pipefail`")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

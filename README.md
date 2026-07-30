@@ -202,7 +202,7 @@ and the other 852 still update.
 python3 -m unittest discover -s tests -t .
 ```
 
-210 tests.
+218 tests.
 Unit tests run against synthetic fixtures that reproduce every structural feature
 of real logs — including all three duplication sources and the signature blob —
 so they never depend on real session content.

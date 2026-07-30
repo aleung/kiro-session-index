@@ -9,6 +9,19 @@
 # Options:
 #   --skill-dir DIR   install somewhere other than ~/.kiro/skills/session-history
 #   --no-index        install only; do not build or refresh the index
+
+# Re-exec under bash when started by another shell, e.g. `sh setup.sh`: dash has no
+# `set -o pipefail` and no ${BASH_SOURCE}, and its failure message points at the wrong
+# thing. Kept in POSIX syntax so dash can parse this block, and placed before any
+# bash-only construct so dash never reaches one.
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v bash > /dev/null 2>&1; then
+        exec bash "$0" "$@"
+    fi
+    echo "error: setup.sh needs bash; install it or run: bash setup.sh" >&2
+    exit 1
+fi
+
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,7 +34,11 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --skill-dir) SKILL_DIR="$2"; shift 2 ;;
         --no-index)  DO_INDEX=0; shift ;;
-        -h|--help)   sed -n '2,12p' "$0"; exit 0 ;;
+        -h|--help)
+            # Print the leading comment block, which stops at the first blank line,
+            # rather than a hardcoded line range that drifts when the header changes.
+            sed -n '2,/^$/p' "$0" | sed 's/^#[[:space:]]\?//'
+            exit 0 ;;
         *) printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
