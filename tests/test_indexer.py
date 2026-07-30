@@ -324,6 +324,106 @@ class TestHardening(IndexerCase):
         self.assertEqual(before, after)
 
 
+class TestCitationConstraint(IndexerCase):
+    """The UNIQUE index exists to catch bugs in this code, not upstream quirks."""
+
+    def test_unique_index_exists(self):
+        names = [r[0] for r in self.q(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+            " AND tbl_name='messages'")]
+        self.assertIn("ux_msg_citation", names)
+
+    def test_double_insert_without_drop_is_rejected(self):
+        """Simulates the drop_session() bug the constraint is there to catch."""
+        con = sqlite3.connect(self.c.db)
+        try:
+            row = con.execute(
+                "SELECT session_id, message_id, content_index, seq, kind, role,"
+                " content_type, text, ts FROM messages"
+                " WHERE message_id IS NOT NULL LIMIT 1").fetchone()
+            nxt = con.execute("SELECT MAX(id)+1 FROM messages").fetchone()[0]
+            with self.assertRaises(sqlite3.IntegrityError):
+                con.execute("INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            (nxt,) + row)
+        finally:
+            con.close()
+
+    def test_duplicate_upstream_anchor_fails_only_that_session(self):
+        self.c.duplicate_citation("sess0001")
+        stats = I.update(db_path=self.c.db, sessions_dir=self.c.root)
+        self.assertEqual(stats["files_failed"], 1)
+        self.assertEqual(stats["failures"][0][0], "sess0001")
+        self.assertIn("IntegrityError", stats["failures"][0][1])
+
+    def test_other_sessions_survive_a_failure(self):
+        self.c.duplicate_citation("sess0001")
+        self.c.append_line("sess0002", "别的会话必须照常 still indexed")
+        I.update(db_path=self.c.db, sessions_dir=self.c.root)
+        self.assertGreater(self.one(
+            "SELECT count(*) FROM messages WHERE session_id='sess0000'"), 0)
+        self.assertGreater(fts_search(self.c.db, "别的会话必须照常"), 0)
+
+    def test_failed_session_leaves_no_partial_rows(self):
+        self.c.duplicate_citation("sess0001")
+        I.update(db_path=self.c.db, sessions_dir=self.c.root)
+        for table in ("messages", "tool_calls", "tool_results"):
+            self.assertEqual(self.one(
+                f"SELECT count(*) FROM {table} WHERE session_id='sess0001'"), 0,
+                f"{table} still holds rows for the failed session")
+
+    def test_index_stays_internally_consistent_after_failure(self):
+        self.c.duplicate_citation("sess0001")
+        I.update(db_path=self.c.db, sessions_dir=self.c.root)
+        # every tool_result still resolves to a stored payload
+        self.assertEqual(self.one(
+            "SELECT count(*) FROM tool_results r"
+            " LEFT JOIN tool_output o ON o.id=r.output_id WHERE o.id IS NULL"), 0)
+        # no payload left dangling
+        self.assertEqual(self.one(
+            "SELECT count(*) FROM tool_output o"
+            " LEFT JOIN tool_results r ON r.output_id=o.id"
+            " WHERE r.tool_use_id IS NULL"), 0)
+        # FTS rows still line up with indexed messages
+        self.assertEqual(self.one("SELECT count(*) FROM messages_fts"),
+                         self.one("SELECT count(*) FROM messages"
+                                  " WHERE text IS NOT NULL"))
+
+    def test_failure_is_retried_on_next_run(self):
+        self.c.duplicate_citation("sess0001")
+        I.update(db_path=self.c.db, sessions_dir=self.c.root)
+        again = I.update(db_path=self.c.db, sessions_dir=self.c.root)
+        self.assertEqual(again["files_failed"], 1)
+
+    def test_recovers_once_the_source_is_fixed(self):
+        path = os.path.join(self.c.root, "sess0001.jsonl")
+        self.c.duplicate_citation("sess0001")
+        I.update(db_path=self.c.db, sessions_dir=self.c.root)
+        with open(path, encoding="utf8") as fh:
+            lines = fh.read().splitlines()
+        with open(path, "w", encoding="utf8") as f:
+            f.write("\n".join(lines[:-1]) + "\n")
+        os.utime(path, None)
+        stats = I.update(db_path=self.c.db, sessions_dir=self.c.root)
+        self.assertEqual(stats["files_failed"], 0)
+        self.assertGreater(self.one(
+            "SELECT count(*) FROM messages WHERE session_id='sess0001'"), 0)
+
+    def test_dedup_cache_survives_a_rollback(self):
+        """A rollback invalidates cached sha1 -> id mappings; resync() must fix it."""
+        self.c.duplicate_citation("sess0000")   # fails, rolls back, resyncs
+        self.c.append_line("sess0002", "回滚之后仍需去重 after rollback")
+        I.update(db_path=self.c.db, sessions_dir=self.c.root)
+        self.assertEqual(self.one(
+            "SELECT count(*) FROM tool_output o"
+            " LEFT JOIN tool_results r ON r.output_id=o.id"
+            " WHERE r.tool_use_id IS NULL"), 0)
+        # the shared payload is still stored exactly once
+        import hashlib
+        self.assertEqual(self.one(
+            "SELECT count(*) FROM tool_output WHERE sha1=?",
+            hashlib.sha1(F.DUPLICATE_OUTPUT.encode()).hexdigest()), 1)
+
+
 class TestSchemaVersion(IndexerCase):
     def test_current_version_recorded(self):
         self.assertEqual(

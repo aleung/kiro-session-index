@@ -139,3 +139,21 @@ class Corpus:
         # Force a visible mtime change even on coarse-grained filesystems.
         st = os.stat(p)
         os.utime(p, (st.st_atime, st.st_mtime + 2))
+
+    def duplicate_citation(self, session_id):
+        """Append a record reusing an existing (message_id, content_index).
+
+        Real logs never do this -- 24,207 records carrying a message_id, zero
+        duplicates -- but the indexer must degrade gracefully if they ever did. The
+        same violation is what would surface a drop_session() bug, which is the
+        constraint's real purpose.
+        """
+        p = os.path.join(self.root, f"{session_id}.jsonl")
+        with open(p, "a", encoding="utf8") as f:
+            f.write(_rec("Prompt", {
+                "message_id": f"{session_id}-m1",   # collides with the first record
+                "meta": {"timestamp": 1776360000},
+                "content": [{"kind": "text", "data": "重复的引用锚点 duplicate anchor"}],
+            }) + "\n")
+        st = os.stat(p)
+        os.utime(p, (st.st_atime, st.st_mtime + 2))

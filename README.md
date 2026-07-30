@@ -156,15 +156,23 @@ There is a regression test for exactly this.
 ## Citations
 
 `message_id:content_index` is the stable anchor.
-`message_id` is a native UUID: verified unique across 24,083 records with no cross-session
+`message_id` is a native UUID: verified unique across 24,207 records with no cross-session
 collisions.
+The composite matters — one record can emit several content items,
+so 21,148 indexed rows come from 14,520 distinct `message_id`s.
 Rowids are *not* stable across re-indexing, so cite the anchor.
 
-Uniqueness is deliberately *not* enforced as a `UNIQUE` constraint:
-it is a property of the upstream logs, not an invariant this tool controls.
-Enforcing it would turn a benign upstream quirk into a failed index update,
-and `INSERT OR REPLACE` would silently drop a record.
-An integration test asserts the property instead.
+The anchor is enforced by a `UNIQUE` index.
+Its purpose is catching bugs in *this* code rather than policing upstream data:
+if `drop_session()` ever failed to clear a session before re-inserting it,
+the constraint fires immediately
+instead of silently double-indexing and inflating counts.
+
+So that one anomaly cannot block every query,
+each file is its own unit of work:
+a violation rolls back and drops only that session, is reported by name,
+and the other 852 still update.
+`ksi-index` exits non-zero when any session fails.
 
 ## Tests
 
@@ -172,7 +180,7 @@ An integration test asserts the property instead.
 python3 -m unittest discover -s tests -t .
 ```
 
-168 tests.
+177 tests.
 Unit tests run against synthetic fixtures that reproduce every structural feature
 of real logs — including all three duplication sources and the signature blob —
 so they never depend on real session content.

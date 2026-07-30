@@ -50,6 +50,12 @@ def main():
         if stats["bad_lines"]:
             print(f"warning: skipped {stats['bad_lines']} unparseable line(s)",
                   file=sys.stderr)
+        if stats["files_failed"]:
+            print(f"error: {stats['files_failed']} session(s) could not be indexed; "
+                  f"the rest of the index is up to date:", file=sys.stderr)
+            for session_id, reason in stats["failures"]:
+                print(f"  {session_id}: {reason}", file=sys.stderr)
+            return 1
     return 0
 
 

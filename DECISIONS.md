@@ -5,7 +5,7 @@
 
 - [Confirmed with the user](#confirmed-with-the-user)
 - [Decided autonomously — please review](#decided-autonomously--please-review)
-  - [1. Citation index is not `UNIQUE`](#1-citation-index-is-not-unique)
+  - [1. Citation index is `UNIQUE`, with per-file failure isolation](#1-citation-index-is-unique-with-per-file-failure-isolation)
   - [2. Schema version triggers an automatic rebuild](#2-schema-version-triggers-an-automatic-rebuild)
   - [3. `status` column on `tool_results`](#3-status-column-on-tool_results)
   - [4. `Clear` records stored as boundary markers](#4-clear-records-stored-as-boundary-markers)
@@ -42,20 +42,40 @@ Made while the user was asleep, per instruction to proceed and record.
 None of these contradict the twelve decisions above; each resolves a detail that only
 surfaced during implementation.
 
-### 1. Citation index is not `UNIQUE`
+### 1. Citation index is `UNIQUE`, with per-file failure isolation
 
-**Found by a test.**
-The unique constraint on `(message_id, content_index)` crashed the indexer when a
-message_id repeated, aborting the entire update.
+**This entry previously recorded the opposite decision. It was wrong, and the original
+reasoning was based on a false premise.**
 
-Uniqueness is a property of the upstream logs — verified across 24,083 records with zero
-duplicates — not an invariant this tool controls.
-Enforcing it converts a benign upstream quirk into total failure,
-and `INSERT OR REPLACE` would silently drop a record instead.
+What actually happened: `test_reindex_after_append_does_not_duplicate` crashed on the
+`UNIQUE` constraint. The cause was a bug in the *test fixture* — `append_line()` wrote a
+hardcoded `message_id`, so appending twice produced two records sharing an id. Real logs
+never do this: measured 24,207 records carrying a `message_id`, 24,207 distinct, zero
+duplicates, zero cross-session collisions.
 
-**Decision:** plain index for lookup speed;
-an integration test asserts uniqueness on the real corpus.
-Reversible: restoring the constraint is a one-line schema change.
+I fixed the fixture *and* demoted the constraint. Only the first was warranted.
+
+The reasoning error was mistaking what the constraint protects against. Its real value is
+catching bugs in **this** code: if `drop_session()` ever fails to clear a session before
+re-inserting it, the constraint fires immediately, instead of silently double-indexing
+content and producing duplicate hits with inflated counts. Removing it traded a guard
+against a likely failure for immunity to a measured-zero one — and the failure it guards
+against is precisely the silent kind this project exists to eliminate.
+
+**Decision:** `ux_msg_citation` is `UNIQUE`. To avoid the original concern (one anomaly
+aborting everything and blocking all queries), each file is its own unit of work: a
+violation rolls back and drops only that session, reports it, and the remaining sessions
+still update. `ksi-index` exits non-zero and names the failed sessions.
+
+Rollback safety needed one extra piece: `Indexer.resync()`. The `sha1 -> id` cache for
+content-addressed tool output would otherwise survive a rollback pointing at rows that no
+longer exist, silently corrupting every file indexed afterwards. There is a test for that.
+
+Verified: full rebuild of 853 sessions under the constraint gives `files_failed: 0`.
+
+Also note a side effect: the integration suite calls `update()` against the real default
+index, so running the tests refreshes it. Harmless — the operation is idempotent — but it
+means the tests are not side-effect free.
 
 ### 2. Schema version triggers an automatic rebuild
 

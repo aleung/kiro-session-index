@@ -19,7 +19,7 @@ from . import text as T
 
 DEFAULT_SESSIONS = os.path.expanduser("~/.kiro/sessions/cli")
 DEFAULT_DB = os.path.expanduser("~/.cache/kiro-session-index/index.db")
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 # FileRead output duplicates files that still exist on disk, where ripgrep searches
 # them better and fresher. 12.76 MB of the 33.6 MB of tool output, for near-zero value.
@@ -119,6 +119,15 @@ def _result_status(result):
 class Indexer:
     def __init__(self, con):
         self.con = con
+        self.resync()
+
+    def resync(self):
+        """(Re)load id counters and the content-address cache from the database.
+
+        Required after a rollback: the sha1 -> id cache would otherwise point at rows
+        that no longer exist, silently corrupting every file indexed afterwards.
+        """
+        con = self.con
         self.next_msg = (
             con.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0] + 1
         )
@@ -396,10 +405,29 @@ def update(db_path=None, sessions_dir=None, full=False, verbose=False):
             idx.drop_session(session_id)
 
         totals = {"messages": 0, "tool_calls": 0, "tool_results": 0, "bad_lines": 0}
+        failed = []
         for path in targets:
             session_id = os.path.basename(path)[: -len(".jsonl")]
-            idx.drop_session(session_id)
-            stats = idx.index_file(path)
+            # Each file is its own unit of work. A failure -- most likely the
+            # ux_msg_citation constraint catching an insertion bug or genuinely
+            # duplicated upstream ids -- must abort only this session, loudly, while
+            # the other 852 still update. Failing the whole run would block every
+            # query, which is a worse outcome than one missing session.
+            try:
+                idx.drop_session(session_id)
+                stats = idx.index_file(path)
+                con.commit()
+            except (sqlite3.Error, ValueError, OSError) as exc:
+                con.rollback()
+                idx.resync()  # the rollback invalidated cached ids
+                try:
+                    idx.drop_session(session_id)  # leave no partial session behind
+                    con.commit()
+                except sqlite3.Error:
+                    con.rollback()
+                idx.resync()
+                failed.append((session_id, f"{type(exc).__name__}: {exc}"))
+                continue
             for k in totals:
                 totals[k] += stats[k]
             if verbose:
@@ -423,7 +451,9 @@ def update(db_path=None, sessions_dir=None, full=False, verbose=False):
     _harden(db_path)
 
     return {
-        "files_indexed": len(targets),
+        "files_indexed": len(targets) - len(failed),
+        "files_failed": len(failed),
+        "failures": failed,
         "sessions_removed": len(gone),
         "outputs_gc": removed,
         "schema_rebuild": rebuilt_for_schema,

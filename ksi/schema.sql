@@ -102,12 +102,22 @@ CREATE VIRTUAL TABLE IF NOT EXISTS tool_output_fts USING fts5(
     contentless_delete = 1
 );
 
--- Citation lookups. Deliberately NOT UNIQUE: message_id uniqueness is a property of
--- the upstream logs (measured: 24,083 records, zero duplicates, no cross-session
--- collisions), not an invariant this tool controls. A UNIQUE constraint would turn a
--- benign upstream quirk into a failed index update, and INSERT OR REPLACE would
--- silently drop a record. Uniqueness is asserted in the integration tests instead.
-CREATE INDEX IF NOT EXISTS ix_msg_citation ON messages(message_id, content_index);
+-- Citation anchor, and an always-on integrity check.
+--
+-- UNIQUE is deliberate. Its real value is catching bugs in THIS code: if
+-- drop_session() ever fails to clear a session before re-inserting it, this fires
+-- immediately instead of silently double-indexing content, which would inflate
+-- counts and produce duplicate search hits.
+--
+-- The upstream data satisfies it: measured 24,207 records carrying a message_id,
+-- 24,207 distinct, zero duplicates, zero cross-session collisions. Note that
+-- message_id alone is NOT sufficient -- one record can emit several content items
+-- (text + thinking + toolUse), so 21,125 indexed rows come from 14,520 message_ids.
+-- The composite with content_index is the correct grain.
+--
+-- A violation aborts only the offending session, not the whole update: see the
+-- per-file isolation in index.update().
+CREATE UNIQUE INDEX IF NOT EXISTS ux_msg_citation ON messages(message_id, content_index);
 CREATE INDEX IF NOT EXISTS ix_msg_session ON messages(session_id);
 CREATE INDEX IF NOT EXISTS ix_msg_ts      ON messages(ts);
 CREATE INDEX IF NOT EXISTS ix_tc_session  ON tool_calls(session_id);
