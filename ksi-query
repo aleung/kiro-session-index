@@ -5,6 +5,11 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Keep __pycache__ out of the install directory: when installed as a skill it lives
+# inside ~/.kiro, which is a git repo. Set before importing ksi so it takes effect.
+sys.pycache_prefix = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+    "kiro-session-index", "pycache")
 
 from ksi import query  # noqa: E402
 

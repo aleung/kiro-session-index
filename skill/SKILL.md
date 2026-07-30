@@ -8,18 +8,17 @@ description: "Search past Kiro CLI sessions to recover earlier decisions, discus
 A local SQLite index over `~/.kiro/sessions/cli/*.jsonl` — every past session, searchable.
 Use it to recover *why* something was decided, not just what the current memory files summarise.
 
-Repo: `~/projects/personal/kiro-session-index`
+Tools: `@TOOL_DIR@` (self-contained; needs nothing else installed)
 Index: `~/.cache/kiro-session-index/index.db` (auto-refreshed, `0600`, outside any git repo)
 
 ## Always query through `ksi-query`
 
 ```bash
-cd ~/projects/personal/kiro-session-index
-./ksi-query "记忆 遗忘"            # prose: user turns, assistant text, thinking, tool purposes
-./ksi-query -t "connection refused" # tool output: command results, transient errors
-./ksi-query -l "abaseSy"            # exact substring (code fragments MATCH cannot find)
-./ksi-query --sql "SELECT ..."      # arbitrary SQL
-./ksi-query --status                # counts and freshness
+@TOOL_DIR@/ksi-query "记忆 遗忘"             # prose: user turns, assistant text, thinking, tool purposes
+@TOOL_DIR@/ksi-query -t "connection refused"  # tool output: command results, transient errors
+@TOOL_DIR@/ksi-query -l "abaseSy"             # exact substring (code fragments MATCH cannot find)
+@TOOL_DIR@/ksi-query --sql "SELECT ..."       # arbitrary SQL
+@TOOL_DIR@/ksi-query --status                 # counts and freshness
 ```
 
 Never open the database directly with `sqlite3`. The wrapper is the only entry point
@@ -71,21 +70,21 @@ recording a conclusion that came from a past session. Rowids are not stable.
 
 ```bash
 # which past sessions touched a file
-./ksi-query --sql "SELECT s.created_at, s.title, t.name, t.path
+@TOOL_DIR@/ksi-query --sql "SELECT s.created_at, s.title, t.name, t.path
   FROM tool_calls t JOIN sessions s USING(session_id)
   WHERE t.path LIKE '%nightly-consolidation%' ORDER BY s.created_at"
 
 # commands that failed, and what they were trying to do
-./ksi-query --sql "SELECT s.project, c.purpose, r.tool_name FROM tool_results r
+@TOOL_DIR@/ksi-query --sql "SELECT s.project, c.purpose, r.tool_name FROM tool_results r
   JOIN tool_calls c USING(tool_use_id) JOIN sessions s ON s.session_id=r.session_id
   WHERE r.status='error' LIMIT 20"
 
 # what a subagent was asked to do
-./ksi-query --sql "SELECT p.title AS parent, c.title AS child, c.agent_name
+@TOOL_DIR@/ksi-query --sql "SELECT p.title AS parent, c.title AS child, c.agent_name
   FROM sessions c JOIN sessions p ON p.session_id=c.parent_session_id"
 
 # readable snippets inside your own SQL
-./ksi-query --sql "SELECT s.title, snip(m.text,'索引',30) FROM messages m
+@TOOL_DIR@/ksi-query --sql "SELECT s.title, snip(m.text,'索引',30) FROM messages m
   JOIN sessions s USING(session_id) WHERE m.text LIKE '%索引%' LIMIT 5"
 ```
 
@@ -107,9 +106,10 @@ separate table. "Why did we decide X" → prose. "Have I seen this error" → `-
 ## Rebuilding
 
 ```bash
-./ksi-index          # incremental (~0.3 s); normally automatic
-./ksi-index --full   # from scratch (~3 s for 853 sessions)
+@TOOL_DIR@/ksi-index          # incremental (~0.3 s); normally automatic
+@TOOL_DIR@/ksi-index --full   # from scratch (~3 s for 853 sessions)
 ```
 
-Losing the index is harmless — it is a derived cache and rebuilds from the immutable
-logs. The source under `~/.kiro/sessions/` is never written to.
+`ksi-index` exits non-zero and names any session it could not index; the rest still
+update. Losing the index entirely is harmless — it is a derived cache and rebuilds from
+the immutable logs. The source under `~/.kiro/sessions/` is never written to.

@@ -28,14 +28,33 @@ Zero dependencies: python3 stdlib only.
 ## Install
 
 ```bash
-./setup.sh
+./setup.sh                    # install and build the index
+./setup.sh --no-index         # install only
+./setup.sh --skill-dir DIR    # install elsewhere
 ```
 
-This checks that your `sqlite3` can create the required FTS5 table,
-installs the `session-history` skill into `~/.kiro/skills/`,
-and builds the index.
+`setup.sh` copies **everything needed** — `SKILL.md`, both entry points, and the `ksi`
+package — into the skill directory,
+following the convention of other skills here (code under `scripts/`).
+
+**After setup, this repo is not used at runtime.**
+The installed copy contains no reference back to it,
+and `setup.sh` verifies that before finishing:
+it greps the install for the repo path, checks no placeholder went unsubstituted,
+confirms every expected file arrived,
+and runs the installed `ksi-query` from `/` with `PYTHONPATH` cleared.
+
+Re-run `setup.sh` after changing anything in the repo.
+It replaces `scripts/` wholesale, so a renamed or deleted module cannot linger and shadow
+current code.
 
 ## Use
+
+```bash
+~/.kiro/skills/session-history/scripts/ksi-query "记忆 遗忘"
+```
+
+Or from the repo during development:
 
 ```bash
 ./ksi-query "记忆 遗忘"             # prose search
@@ -54,9 +73,12 @@ but the execution *path* is fixed so that three silent failure modes cannot bite
 
 | What | Where | Why |
 |---|---|---|
+| Installed tools | `~/.kiro/skills/session-history/scripts/` | Self-contained: entry points plus the `ksi` package. The skill directory is the runtime location. |
+| Skill doc | `~/.kiro/skills/session-history/SKILL.md` | Rendered from `skill/SKILL.md` with paths substituted. |
 | Index | `~/.cache/kiro-session-index/index.db` | Purely derived; XDG cache semantics. Outside any git repo, so it can never be committed. `0600` including `-wal`/`-shm`. |
+| Bytecode cache | `~/.cache/kiro-session-index/pycache/` | Redirected via `sys.pycache_prefix`, because the install sits inside `~/.kiro`, which is a git repo. |
 | Source logs | `~/.kiro/sessions/cli/` | Read-only truth. Never written to. |
-| Skill | `~/.kiro/skills/session-history/` | Copied by `setup.sh`; this repo is the source of truth. |
+| This repo | `~/projects/personal/kiro-session-index` | Source of truth for development. Not needed at runtime. |
 
 ## Measured on 853 sessions / 116 MB of logs
 
@@ -180,7 +202,7 @@ and the other 852 still update.
 python3 -m unittest discover -s tests -t .
 ```
 
-177 tests.
+190 tests.
 Unit tests run against synthetic fixtures that reproduce every structural feature
 of real logs — including all three duplication sources and the signature blob —
 so they never depend on real session content.
