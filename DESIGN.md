@@ -140,6 +140,10 @@ silently drop records.
 At 2.7 s for a full rebuild that trade buys nothing.
 A test asserts incremental output equals full-rebuild output field by field.
 
+The cost of file granularity is that a growing session is re-parsed in full on every
+refresh: at 4 MB — a long working session — a refresh costs ~0.8 s rather than ~0.3 s.
+Acceptable, and the ceiling is the largest single session rather than the corpus.
+
 **Two FTS corpora.**
 Prose and tool output are indexed separately so BM25 ranking over the 9.9 MB that matters
 is not swamped by machine output.

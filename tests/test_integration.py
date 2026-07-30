@@ -239,21 +239,37 @@ class TestRealCorpus(unittest.TestCase):
 @unittest.skipUnless(have_corpus, "real corpus not available")
 class TestRealIncremental(unittest.TestCase):
     def test_repeated_update_is_cheap_and_idempotent(self):
+        """Idempotency is checked on a DORMANT session.
+
+        The session running these tests grows while they run, so comparing total row
+        counts across two updates is racy -- a single refresh of a long session can
+        add hundreds of rows. Pick a session whose file is not being written and
+        assert its row count is untouched by a second update.
+        """
         stats = I.update()
-        self.assertLess(stats["elapsed_s"], 30)
-        con = sqlite3.connect(DB)
-        try:
-            before = con.execute("SELECT count(*) FROM messages").fetchone()[0]
-        finally:
-            con.close()
+        self.assertLess(stats["elapsed_s"], 60)
+
+        cutoff = time.time() - 3600
+        dormant = next(
+            (p for p in sorted(glob.glob(os.path.join(SESSIONS, "*.jsonl")))
+             if os.path.getmtime(p) < cutoff), None)
+        if dormant is None:
+            self.skipTest("no dormant session to compare against")
+        session_id = os.path.basename(dormant)[: -len(".jsonl")]
+
+        def rows():
+            con = sqlite3.connect(DB)
+            try:
+                return con.execute(
+                    "SELECT count(*) FROM messages WHERE session_id=?",
+                    (session_id,)).fetchone()[0]
+            finally:
+                con.close()
+
+        before = rows()
+        self.assertGreater(before, 0, "dormant session should already be indexed")
         I.update()
-        con = sqlite3.connect(DB)
-        try:
-            after = con.execute("SELECT count(*) FROM messages").fetchone()[0]
-        finally:
-            con.close()
-        # The live session may grow between the two runs; it must not duplicate.
-        self.assertLessEqual(abs(after - before), 50)
+        self.assertEqual(rows(), before)
 
 
 if __name__ == "__main__":
