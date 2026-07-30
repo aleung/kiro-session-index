@@ -1,0 +1,18 @@
+# The index itself lives in ~/.cache/kiro-session-index/ and must never be committed.
+# These patterns are a belt-and-braces guard in case anyone points --db at the repo.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Extracted session content, ever.
+*.jsonl
+prose.txt
+/scratch/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/

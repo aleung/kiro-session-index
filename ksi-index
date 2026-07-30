@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""Build or refresh the session index.
+
+Usage:
+  ksi-index                 # incremental: only re-parse changed session files
+  ksi-index --full          # rebuild from scratch
+  ksi-index --verbose       # list each session as it is indexed
+"""
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from ksi import index as I  # noqa: E402
+
+
+def main():
+    p = argparse.ArgumentParser(prog="ksi-index", description=__doc__,
+                               formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--full", action="store_true", help="discard and rebuild the index")
+    p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--db", help=f"index path (default {I.DEFAULT_DB})")
+    p.add_argument("--sessions", help=f"source logs (default {I.DEFAULT_SESSIONS})")
+    args = p.parse_args()
+
+    src = args.sessions or I._sessions_dir()
+    if not os.path.isdir(src):
+        print(f"error: no session directory at {src}", file=sys.stderr)
+        return 2
+
+    stats = I.update(db_path=args.db, sessions_dir=args.sessions,
+                     full=args.full, verbose=args.verbose)
+    if args.json:
+        print(json.dumps(stats, indent=2))
+    else:
+        if not stats["files_indexed"] and not stats["sessions_removed"]:
+            print(f"index already current ({stats['elapsed_s']}s)")
+        else:
+            print(f"indexed {stats['files_indexed']} file(s) in {stats['elapsed_s']}s: "
+                  f"{stats['messages']} messages, {stats['tool_calls']} tool calls, "
+                  f"{stats['tool_results']} tool results")
+            if stats["sessions_removed"]:
+                print(f"removed {stats['sessions_removed']} vanished session(s)")
+            if stats["outputs_gc"]:
+                print(f"garbage-collected {stats['outputs_gc']} orphaned output(s)")
+        if stats["bad_lines"]:
+            print(f"warning: skipped {stats['bad_lines']} unparseable line(s)",
+                  file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

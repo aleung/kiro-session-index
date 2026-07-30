@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Search the session index. See `ksi-query --help`."""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from ksi import query  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(query.main())
