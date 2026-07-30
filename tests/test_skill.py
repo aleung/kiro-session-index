@@ -105,7 +105,9 @@ class TestBody(unittest.TestCase):
         self.assertIn("@TOOL_DIR@", self.body)
 
     def test_no_absolute_home_paths_for_tools(self):
-        self.assertNotIn("/home/USER/projects", self.body)
+        """setup.sh substitutes @TOOL_DIR@; a literal /home/<user>/... path would
+        mean the placeholder leaked someone's real install location instead."""
+        self.assertNotRegex(self.body, r"/home/[^/\s]+/")
 
     def test_documents_the_snippet_guard(self):
         self.assertIn("snip(", self.body)

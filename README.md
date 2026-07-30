@@ -85,7 +85,7 @@ Chinese matches inside words: `忘机` finds `遗忘机制`.
 ### Narrowing results
 
 ```bash
-ksi-query "pipeline" --project my-project   # one project
+ksi-query "pipeline" --project my-project     # one project
 ksi-query "pipeline" --since 2026-07-01       # recent only
 ksi-query "pipeline" --role user              # only what you said
 ksi-query -t "error" --tool-status error      # only failed commands
