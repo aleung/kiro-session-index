@@ -1,38 +1,38 @@
 ---
 name: session-history
-description: "Search past Kiro CLI sessions to recover earlier decisions, discussions, commands, and errors. Use when the user asks whether something was discussed or decided before, when a topic last came up, whether an error has been seen previously, which past sessions touched a file, or refers back to an earlier conversation. Triggers: 'did we discuss', 'have we decided', '以前是不是', '之前讨论过', 'when did I', 'have I seen this error', 'what did we say about', 'which session', 'earlier conversation', 'last time we'."
+description: "Load when the user asks what was discussed, decided, or seen in an earlier session, or which past session touched a file. Triggers: 'did we discuss', '之前讨论过', '以前是不是', 'have I seen this error', 'last time we'."
+metadata:
+  version: "1.0.0"
 ---
 
 # Session History
 
-A local SQLite index over `~/.kiro/sessions/cli/*.jsonl` — every past session, searchable.
-Use it to recover *why* something was decided, not just what the current memory files summarise.
+SQLite index over `~/.kiro/sessions/cli/*.jsonl`. Tools: `@TOOL_DIR@`.
 
-Tools: `@TOOL_DIR@` (self-contained; needs nothing else installed)
-Index: `~/.cache/kiro-session-index/index.db` (auto-refreshed, `0600`, outside any git repo)
-
-## Always query through `ksi-query`
+Run every query through `ksi-query`. Never open the database with `sqlite3` — that
+bypasses the CJK query transform, the freshness check, and the `snippet()` guard, each of
+which fails silently rather than erroring.
 
 ```bash
 @TOOL_DIR@/ksi-query "记忆 遗忘"             # prose: user turns, assistant text, thinking, tool purposes
 @TOOL_DIR@/ksi-query -t "connection refused"  # tool output: command results, transient errors
-@TOOL_DIR@/ksi-query -l "abaseSy"             # exact substring (code fragments MATCH cannot find)
+@TOOL_DIR@/ksi-query -l "abaseSy"             # exact substring
 @TOOL_DIR@/ksi-query --sql "SELECT ..."       # arbitrary SQL
 @TOOL_DIR@/ksi-query --status                 # counts and freshness
+@TOOL_DIR@/ksi-index --full                   # rebuild from scratch (~3 s)
 ```
 
-Never open the database directly with `sqlite3`. The wrapper is the only entry point
-because it does three things raw SQL cannot, each preventing a *silent* wrong answer:
+Flags: `-n` limit, `-w` snippet width, `--json`, `--project`, `--session`,
+`--role user|assistant`, `--since YYYY-MM-DD`, `--tool-name`, `--tool-status error`,
+`--with TOKEN` (whole-word prefilter; makes `-l` sub-millisecond), `--no-update`.
 
-1. **Transforms the query.** CJK is indexed character-by-character. An untransformed
-   Chinese query returns zero rows and looks like "we never discussed it".
-2. **Refreshes the index.** Checks source mtimes first, so the session you are in right
-   now is searchable within seconds.
-3. **Provides `snip()` and blocks `snippet()`.** See the traps below.
+## Choosing the corpus
 
-Useful flags: `-n` limit, `-w` snippet width, `--json`, `--project`, `--session`,
-`--role user|assistant`, `--since YYYY-MM-DD`, `--tool-status error`,
-`--with TOKEN` (whole-word prefilter that makes `-l` sub-millisecond), `--no-update`.
+Prose and tool output are separate indexes. Query the wrong one and you get zero rows.
+
+- "Why did we decide X", "what did we say about Y" → default (prose).
+- "Have I seen this error", "what did that command print" → `-t`.
+- Contents of a file that still exists → neither; use ripgrep. `FileRead` output is not indexed.
 
 ## Query syntax
 
@@ -43,7 +43,7 @@ Useful flags: `-n` limit, `-w` snippet width, `--json`, `--project`, `--session`
 | `token*` | prefix match |
 | `memory -pipeline` | first present, second absent |
 
-Chinese matching is substring-like within a run: `忘机` matches `遗忘机制`.
+Chinese matches substring-like within a run: `忘机` matches `遗忘机制`.
 
 ## Schema
 
@@ -60,11 +60,11 @@ tool_output_fts(search_text)              -- contentless; rowid = tool_output.id
 files(path, session_id, mtime, size, indexed_at)
 ```
 
-`ts` is epoch **seconds**, carried forward from the preceding user turn (assistant
-records carry no timestamp of their own).
+`ts` is epoch seconds. `created_reason='subagent'` marks spawned sessions.
+`tool_calls.purpose` is the agent-written intent line — the highest-value search target.
 
-**Citation anchor:** `message_id:content_index`. Stable across rebuilds — cite this when
-recording a conclusion that came from a past session. Rowids are not stable.
+Cite past sessions as `message_id:content_index`. Rowids change on re-index; that pair
+does not.
 
 ## Query patterns
 
@@ -88,28 +88,22 @@ recording a conclusion that came from a past session. Rowids are not stable.
   JOIN sessions s USING(session_id) WHERE m.text LIKE '%索引%' LIMIT 5"
 ```
 
-## Three traps
+## Gotchas
 
-**`snippet()` and `highlight()` are blocked.** On a contentless FTS table they return an
-empty string *without erroring*. Use `snip(text, query [, width])`, which slices the
-original text — and is the only way to get readable Chinese, since the FTS index holds
-character-split text (`snippet()` would yield `知  识  库`).
+<!-- Append here when the agent fails. Each entry prevents a class of errors. -->
 
-**Code substrings need `-l`.** `unicode61` indexes `DatabaseSync` as one token, so
-`getUserName` is findable but `UserName` is not. Whole identifiers via normal search
-(100% recall, camelCase and snake_case); inner fragments via `-l` (~30 ms full scan).
-
-**Two corpora, chosen deliberately.** Prose ranks cleanly because tool output is in a
-separate table. "Why did we decide X" → prose. "Have I seen this error" → `-t`.
-`FileRead` output is *not* indexed: those files still exist on disk, so use ripgrep.
-
-## Rebuilding
-
-```bash
-@TOOL_DIR@/ksi-index          # incremental (~0.3 s); normally automatic
-@TOOL_DIR@/ksi-index --full   # from scratch (~3 s for 853 sessions)
-```
-
-`ksi-index` exits non-zero and names any session it could not index; the rest still
-update. Losing the index entirely is harmless — it is a derived cache and rebuilds from
-the immutable logs. The source under `~/.kiro/sessions/` is never written to.
+- Never call `snippet()` or `highlight()` — `ksi-query` rejects them. On contentless FTS
+  tables they return an empty string without erroring, and on a normal table they would
+  return character-split text (`知  识  库`). Use `snip(text, query [, width])`.
+- Zero rows for a Chinese query does not mean the topic is absent — it usually means the
+  query bypassed `ksi-query`. Re-run through the wrapper before concluding anything.
+- `MATCH` cannot find fragments inside an identifier: `DatabaseSync` is one token, so
+  `getUserName` is findable but `UserName` is not. Use `-l` for inner fragments.
+- Never conclude "we never discussed this" from a single failed query. Try the other
+  corpus (`-t`), then `-l`, then a synonym. The conversation may have used different words.
+- Absence of a `path` in `tool_calls` does not mean no file was touched; only `path` and
+  `file_path` arguments are extracted.
+- `ksi-index` exits non-zero when a session fails to index and names it; the rest of the
+  index is still current. Do not treat a non-zero exit as "the index is broken".
+- Do not add rows to the index by hand. It is a derived cache; the next refresh discards
+  anything not present in the source logs.
