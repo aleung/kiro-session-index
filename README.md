@@ -148,29 +148,13 @@ An older copy of `setup.sh`. Pull the current one; it runs correctly under
 
 ## Credits
 
-Inspired by [obelisk](https://github.com/tommy0103/obelisk) by
-[@tommy0103](https://github.com/tommy0103), which does this for Claude Code and Codex
-sessions. Ideas taken from it:
+Inspired by [obelisk](https://github.com/tommy0103/obelisk), which does this for Claude
+Code and Codex. Borrowed its premise — transcripts are an evidence layer to index, not
+distil — along with letting the agent write SQL directly, proactive as well as reactive
+triggering, and its retrieval discipline.
 
-- **The core premise** — session transcripts are already a complete, immutable evidence
-  layer, so index the originals instead of distilling them into summaries that rot. A
-  distilled memory then becomes a cache with provenance, which is what makes it safe to
-  invalidate and re-derive.
-- **Let the agent write queries** — no fixed query API. Query shapes cannot be enumerated
-  in advance, so expose SQL and let the agent compose it (obelisk calls this CodeAct).
-- **Reactive and proactive triggering** — a history tool that only answers direct questions
-  misses most of its value. Obelisk's skill declares both, and its wording is what
-  prompted adding the proactive clause here.
-- **Retrieval discipline** — narrow before broadening, keep results bounded, answer with
-  stable IDs and short snippets rather than volume.
-
-Independently implemented; no code was taken, so obelisk's AGPL-3.0 does not extend here.
-It differs in target (Kiro CLI rather than Claude Code and Codex), in dependencies
-(python3 stdlib, no Node or Electron), in Chinese support (character-level indexing, which
-obelisk tracks as an open issue), and in scope — obelisk has a memory layer for persisting
-conclusions, which this does not yet.
-
-If you use Claude Code or Codex rather than Kiro, use obelisk instead of this.
+Independently implemented; no code taken, so obelisk's AGPL-3.0 does not extend here.
+If you use Claude Code or Codex, use obelisk instead.
 
 ## More
 
