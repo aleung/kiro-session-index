@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+# kiro-resume — list recent top-level Kiro chat sessions for the current
+# directory and resume one. Sub-agent sessions (those spawned by a parent
+# session) are filtered out by default.
+#
+# Installed by setup.sh into the skill's scripts/ directory, with a symlink
+# placed on PATH. See README.md.
+#
+# Usage:
+#   kiro-resume [-n N] [-a] [--all-dirs] [-s KEYWORD]
+#     -n N        show at most N sessions (default 20)
+#     -a          include sub-agent sessions (parent_session_id set)
+#     --all-dirs  show sessions from every directory, not just $PWD
+#     -s KEYWORD  full-text search over session content via the session-history
+#                 index (ksi-query): conversation prose and tool output, with
+#                 CJK handling and an exact-substring fallback. Hits inside a
+#                 sub-agent session are credited to its top-level parent unless
+#                 -a is given. Implies --all-dirs, shows session cwd and hit
+#                 count, auto-cd on resume.
+#                 KEYWORD is FTS syntax: `a b` = AND, `"a b"` = phrase,
+#                 `a*` = prefix, `a -b` = a without b.
+#
+# Requires: python3. Uses fzf if present, otherwise a numbered menu.
+# Searching uses ~/.kiro/skills/session-history/scripts/ksi-query when present
+# and falls back to a raw scan of the .jsonl logs when it is not.
+
+set -euo pipefail
+
+SESS_DIR="${KIRO_HOME:-$HOME/.kiro}/sessions/cli"
+LIMIT=20
+INCLUDE_SUB=0
+ALL_DIRS=0
+SEARCH=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n) LIMIT="$2"; shift 2 ;;
+    -a) INCLUDE_SUB=1; shift ;;
+    --all-dirs) ALL_DIRS=1; shift ;;
+    -s|--search) SEARCH="$2"; shift 2 ;;
+    -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+
+[ -d "$SESS_DIR" ] || { echo "No sessions directory: $SESS_DIR" >&2; exit 1; }
+
+CWD="$PWD"
+
+# Emit TSV rows: session_id \t age \t title \t short_cwd \t hits, newest first.
+# Session ID is hidden from user display but used internally for resume.
+rows="$(python3 - "$SESS_DIR" "$CWD" "$INCLUDE_SUB" "$ALL_DIRS" "$LIMIT" "$SEARCH" <<'PY'
+import json, os, sys, glob, subprocess, time, calendar
+
+sess_dir, cwd, include_sub, all_dirs, limit, search = sys.argv[1:7]
+include_sub = include_sub == "1"
+all_dirs = all_dirs == "1"
+limit = int(limit)
+search = search.strip()
+
+# -s implies --all-dirs
+if search:
+    all_dirs = True
+
+KSI = os.path.expanduser("~/.kiro/skills/session-history/scripts/ksi-query")
+
+def age(ts):
+    try:
+        t = calendar.timegm(time.strptime(ts.split('.')[0], "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return "?"
+    d = max(time.time() - t, 0)
+    for unit, s in (("d", 86400), ("h", 3600), ("m", 60)):
+        if d >= s:
+            return f"{int(d // s)}{unit} ago"
+    return "just now"
+
+def ksi_hits(keyword):
+    """{session_id: hit_count} from the session-history index.
+
+    Returns None when ksi-query is unavailable, so the caller can fall back to
+    scanning the raw logs. Searches prose and tool output; if full-text finds
+    nothing, retries as an exact substring -- MATCH cannot see inside a token.
+    """
+    if not os.access(KSI, os.X_OK):
+        return None
+    state = {"updated": False}
+
+    def run(args):
+        cmd = [KSI] + args + ["--json", "-n", "300", "-w", "1"]
+        if state["updated"]:
+            cmd.append("--no-update")   # only the first call refreshes the index
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        except (OSError, subprocess.SubprocessError):
+            return []
+        state["updated"] = True
+        if p.returncode != 0:
+            return []
+        try:
+            rows = json.loads(p.stdout or "[]")
+        except ValueError:
+            return []
+        return rows if isinstance(rows, list) else []
+
+    hits = {}
+
+    def add(rows):
+        for r in rows:
+            sid = r.get("session_id")
+            if sid:
+                hits[sid] = hits.get(sid, 0) + 1
+
+    add(run([keyword]))              # conversation prose
+    add(run([keyword, "-t"]))        # tool output
+    if not hits:                     # nothing in full text -> exact substring
+        add(run(["-l", keyword]))
+        add(run(["-l", keyword, "-t"]))
+    return hits
+
+def grep_hits(meta, keyword):
+    """Fallback when ksi-query is absent: substring scan of the raw .jsonl logs."""
+    kw = keyword.lower()
+    hits = {}
+    for sid in meta:
+        try:
+            with open(os.path.join(sess_dir, sid + ".jsonl")) as fh:
+                n = sum(1 for line in fh if kw in line.lower())
+        except Exception:
+            n = 0
+        if n:
+            hits[sid] = n
+    return hits
+
+def roll_up(hits, meta):
+    """Credit a sub-agent session's hits to its nearest top-level ancestor."""
+    out = {}
+    for sid, n in hits.items():
+        root, seen = sid, set()
+        while root in meta and meta[root].get("parent_session_id") and root not in seen:
+            seen.add(root)
+            root = meta[root]["parent_session_id"]
+        out[root] = out.get(root, 0) + n
+    return out
+
+def short_path(p):
+    """Shorten path: ~ for home, last 2 components for long paths."""
+    p = p.replace(os.path.expanduser("~"), "~")
+    parts = p.split("/")
+    if len(parts) > 4:
+        return "~/" + "/".join(parts[-2:])
+    return p
+
+meta = {}
+for jf in glob.glob(os.path.join(sess_dir, "*.json")):
+    try:
+        d = json.load(open(jf))
+    except Exception:
+        continue
+    sid = d.get("session_id") or os.path.splitext(os.path.basename(jf))[0]
+    meta[sid] = d
+
+hits = None
+if search:
+    hits = ksi_hits(search)
+    if hits is None:
+        print("[ksi-query not found: falling back to raw log scan]", file=sys.stderr)
+        hits = grep_hits(meta, search)
+    if not include_sub:
+        hits = roll_up(hits, meta)
+
+items = []
+for sid, d in meta.items():
+    if not include_sub and d.get("parent_session_id"):
+        continue
+    if not all_dirs and d.get("cwd") != cwd:
+        continue
+    if hits is not None and sid not in hits:
+        continue
+    title = (d.get("title") or "(untitled)").replace("\t", " ").replace("\n", " ")
+    sess_cwd = d.get("cwd") or ""
+    items.append((d.get("updated_at", ""), sid, age(d.get("updated_at", "")),
+                  title, sess_cwd, hits.get(sid, 0) if hits else 0))
+
+items.sort(reverse=True)
+for _, sid, a, title, sess_cwd, n in items[:limit]:
+    sc = short_path(sess_cwd)
+    # TSV: sid \t age \t title \t short_cwd \t hits
+    print(f"{sid}\t{a}\t{title}\t{sc}\t{n}")
+PY
+)"
+
+if [ -z "$rows" ]; then
+  if [ -n "$SEARCH" ]; then
+    echo "No sessions matching search: $SEARCH"
+    echo "(-s uses FTS: try a single word, \"a phrase\", or a prefix like term*)"
+    echo "(use -a to include sub-agent sessions)"
+  else
+    echo "No matching top-level sessions for $CWD"
+    echo "(use --all-dirs to search all directories, -a to include sub-agent sessions)"
+    echo "(use -s KEYWORD to search session content across all directories)"
+  fi
+  exit 0
+fi
+
+# Build display lines: "age  [hits]  [cwd]  title" — title fills to terminal edge.
+# sid is kept as a hidden lookup via line number.
+COLS="${COLUMNS:-$(tput cols 2>/dev/null || echo 100)}"
+SHOW_CWD=0
+if [ -n "$SEARCH" ] || [ "$ALL_DIRS" = "1" ]; then SHOW_CWD=1; fi
+SHOW_HITS=0
+if [ -n "$SEARCH" ]; then SHOW_HITS=1; fi
+USE_COLOR=0
+[ -t 2 ] && USE_COLOR=1  # check stderr since stdout may be piped in subshell
+
+display="$(python3 -c "
+import sys, os, unicodedata
+
+cols = int(sys.argv[1])
+show_cwd = sys.argv[2] == '1'
+use_color = sys.argv[3] == '1'
+show_hits = sys.argv[4] == '1'
+# Reserve: 4 chars for line number prefix ('NN  ')
+avail = cols - 4
+
+# ANSI color codes (only if terminal supports color)
+if use_color:
+    DIM   = '\033[2m'     # dim for age
+    CYAN  = '\033[36m'    # cyan for cwd/path
+    YELL  = '\033[33m'    # yellow for hit count
+    RESET = '\033[0m'
+else:
+    DIM = CYAN = YELL = RESET = ''
+
+def display_width(s):
+    \"\"\"Account for wide (CJK) characters taking 2 columns.\"\"\"
+    w = 0
+    for c in s:
+        cat = unicodedata.east_asian_width(c)
+        w += 2 if cat in ('W', 'F') else 1
+    return w
+
+def truncate(s, max_w):
+    \"\"\"Truncate string to max display width, add … if truncated.\"\"\"
+    if display_width(s) <= max_w:
+        return s
+    w = 0
+    out = []
+    for c in s:
+        cw = 2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1
+        if w + cw > max_w - 1:  # 1 for …
+            break
+        out.append(c)
+        w += cw
+    return ''.join(out) + '…'
+
+for line in sys.stdin:
+    parts = line.rstrip('\n').split('\t')
+    if len(parts) < 5:
+        continue
+    sid, age, title, cwd, hits = parts[0], parts[1], parts[2], parts[3], parts[4]
+    # age column: 8 chars + 2 space separator
+    age_str = f'{age:<8s}  '
+    used = 10
+    hits_part = ''
+    if show_hits:
+        # hit-count column: 5 chars + 1 space separator
+        hits_display = (hits + 'x').rjust(5) + ' '
+        used += len(hits_display)
+        hits_part = f'{YELL}{hits_display}{RESET}'
+    cwd_part = ''
+    if show_cwd:
+        # cwd column: actual width + 2 space separator
+        cwd_display = cwd + '  '
+        used += display_width(cwd_display)
+        cwd_part = f'{CYAN}{cwd_display}{RESET}'
+    title_max = avail - used
+    if title_max < 10:
+        title_max = 10
+    t = truncate(title, title_max)
+    print(f'{DIM}{age_str}{RESET}{hits_part}{cwd_part}{t}')
+" "$COLS" "$SHOW_CWD" "$USE_COLOR" "$SHOW_HITS" <<<"$rows")"
+
+if command -v fzf >/dev/null 2>&1; then
+  chosen_line="$(nl -ba -w2 -s'│' <<<"$display" | \
+    fzf --ansi --no-sort --prompt='resume session> ' \
+        --header='Select a session to resume (Esc to cancel)' \
+        --delimiter='│' --with-nth=2)" || { echo "cancelled"; exit 0; }
+  line_num="$(echo "$chosen_line" | awk -F'│' '{print $1}' | tr -d ' ')"
+else
+  if [ -n "$SEARCH" ]; then
+    echo "Sessions matching '$SEARCH':"
+  else
+    echo "Recent sessions:"
+  fi
+  echo
+  nl -ba -w2 -s'  ' <<<"$display"
+  echo
+  printf "Number to resume (blank to cancel): "
+  read -r n
+  [ -z "${n:-}" ] && { echo "cancelled"; exit 0; }
+  line_num="$n"
+fi
+
+[ -z "${line_num:-}" ] && { echo "cancelled"; exit 0; }
+
+# Extract session id from the raw rows by line number
+sid="$(sed -n "${line_num}p" <<<"$rows" | cut -f1)"
+
+[ -z "${sid:-}" ] && { echo "Invalid selection"; exit 1; }
+
+# Resolve the session's cwd for auto-cd
+sess_cwd="$(python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(d.get('cwd', ''))
+except:
+    pass
+" "$SESS_DIR/$sid.json")"
+
+# If session cwd differs from current dir and exists, auto-cd into it
+if [ -n "$sess_cwd" ] && [ "$sess_cwd" != "$PWD" ] && [ -d "$sess_cwd" ]; then
+  echo "Resuming $sid ..."
+  echo "  cd $sess_cwd"
+  exec bash -c "cd '$sess_cwd' && exec kiro-cli chat --resume-id '$sid'"
+else
+  echo "Resuming $sid ..."
+  exec kiro-cli chat --resume-id "$sid"
+fi

@@ -19,6 +19,7 @@ SETUP = os.path.join(REPO, "setup.sh")
 
 EXPECTED = [
     "SKILL.md",
+    "scripts/kiro-resume",
     "scripts/ksi-index",
     "scripts/ksi-query",
     "scripts/ksi/__init__.py",
@@ -28,6 +29,10 @@ EXPECTED = [
     "scripts/ksi/schema.sql",
 ]
 
+# Which tools setup.sh puts on PATH. ksi-index is deliberately absent: every query
+# refreshes the index, so a manual rebuild is rare.
+EXPECTED_LINKS = ["kiro-resume", "ksi-query"]
+
 
 @unittest.skipUnless(shutil.which("bash"), "bash not available")
 class TestSetup(unittest.TestCase):
@@ -35,8 +40,11 @@ class TestSetup(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
         cls.skill_dir = os.path.join(cls.tmp.name, "session-history")
+        # Never the real ~/bin: this suite installs and reinstalls repeatedly.
+        cls.bin_dir = os.path.join(cls.tmp.name, "bin")
         proc = subprocess.run(
-            ["bash", SETUP, "--skill-dir", cls.skill_dir, "--no-index"],
+            ["bash", SETUP, "--skill-dir", cls.skill_dir,
+             "--bin-dir", cls.bin_dir, "--no-index"],
             capture_output=True, text=True, cwd="/")
         cls.proc = proc
         if proc.returncode != 0:
@@ -59,8 +67,46 @@ class TestSetup(unittest.TestCase):
                             f"missing {rel}")
 
     def test_entry_points_are_executable(self):
-        for name in ("ksi-index", "ksi-query"):
+        for name in ("ksi-index", "ksi-query", "kiro-resume"):
             self.assertTrue(os.access(os.path.join(self.tools, name), os.X_OK), name)
+
+    def test_path_links_created(self):
+        for name in EXPECTED_LINKS:
+            link = os.path.join(self.bin_dir, name)
+            self.assertTrue(os.path.islink(link), f"{name} is not a symlink")
+            self.assertEqual(os.path.realpath(link),
+                             os.path.realpath(os.path.join(self.tools, name)))
+
+    def test_index_tool_is_not_linked(self):
+        """Deliberate: refreshing happens on every query, so ksi-index stays unlinked."""
+        self.assertFalse(os.path.exists(os.path.join(self.bin_dir, "ksi-index")))
+
+    def test_linked_tool_runs_through_the_symlink(self):
+        """The symlink is what makes `import ksi` resolve from a PATH directory.
+
+        CPython resolves the link before computing sys.path[0], so the entry point
+        finds the package beside its real location rather than beside the link.
+        """
+        env = dict(os.environ)
+        env.pop("PYTHONPATH", None)
+        proc = subprocess.run([os.path.join(self.bin_dir, "kiro-resume"), "--help"],
+                              capture_output=True, text=True, cwd="/", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_link_replaces_a_pre_existing_plain_file(self):
+        """Installing over a hand-written script of the same name must win."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = os.path.join(tmp, "bin")
+            os.makedirs(bin_dir)
+            victim = os.path.join(bin_dir, "kiro-resume")
+            with open(victim, "w") as fh:
+                fh.write("#!/bin/sh\necho an older hand-written copy\n")
+            proc = subprocess.run(
+                ["bash", SETUP, "--skill-dir", os.path.join(tmp, "skill"),
+                 "--bin-dir", bin_dir, "--no-index"],
+                capture_output=True, text=True, cwd="/")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertTrue(os.path.islink(victim))
 
     def test_no_reference_to_source_repo_anywhere(self):
         """The core requirement: nothing in the install points back at the repo."""
@@ -127,7 +173,8 @@ class TestSetup(unittest.TestCase):
         with open(stale, "w") as fh:
             fh.write("# left over from an older version\n")
         proc = subprocess.run(
-            ["bash", SETUP, "--skill-dir", self.skill_dir, "--no-index"],
+            ["bash", SETUP, "--skill-dir", self.skill_dir,
+             "--bin-dir", self.bin_dir, "--no-index"],
             capture_output=True, text=True, cwd="/")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertFalse(os.path.exists(stale),
@@ -161,7 +208,8 @@ class TestInvocation(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         skill_dir = os.path.join(tmp.name, "session-history")
         proc = subprocess.run(
-            argv + ["--skill-dir", skill_dir, "--no-index"],
+            argv + ["--skill-dir", skill_dir,
+                    "--bin-dir", os.path.join(tmp.name, "bin"), "--no-index"],
             capture_output=True, text=True, cwd=REPO)
         installed = sorted(
             os.path.relpath(os.path.join(r, f), skill_dir)
@@ -200,6 +248,7 @@ class TestInvocation(unittest.TestCase):
                               capture_output=True, text=True, cwd=REPO)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("--skill-dir", proc.stdout)
+        self.assertIn("--bin-dir", proc.stdout)
         self.assertIn("--no-index", proc.stdout)
         self.assertNotIn("#", proc.stdout)  # comment markers stripped
 

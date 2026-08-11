@@ -8,6 +8,7 @@
 #
 # Options:
 #   --skill-dir DIR   install somewhere other than ~/.kiro/skills/session-history
+#   --bin-dir DIR     put the kiro-resume/ksi-query symlinks somewhere other than ~/bin
 #   --no-index        install only; do not build or refresh the index
 
 # Re-exec under bash when started by another shell, e.g. `sh setup.sh`: dash has no
@@ -28,11 +29,16 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_NAME="session-history"
 SKILL_ROOT="${KIRO_SKILLS_DIR:-$HOME/.kiro/skills}"
 SKILL_DIR="$SKILL_ROOT/$SKILL_NAME"
+# Human-invoked tools need to be on PATH to exist at all, so the install places
+# symlinks itself rather than printing a suggestion. Overridable because the tests
+# must never write into the real ~/bin.
+BIN_DIR="${KIRO_BIN_DIR:-$HOME/bin}"
 DO_INDEX=1
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --skill-dir) SKILL_DIR="$2"; shift 2 ;;
+        --bin-dir)   BIN_DIR="$2"; shift 2 ;;
         --no-index)  DO_INDEX=0; shift ;;
         -h|--help)
             # Print the leading comment block, which stops at the first blank line,
@@ -70,7 +76,7 @@ say "✓ python3 $(python3 -c 'import sqlite3;print("with sqlite "+sqlite3.sqlit
 # the current code.
 rm -rf "$TOOL_DIR"
 mkdir -p "$TOOL_DIR/ksi"
-install -m 0755 "$REPO/ksi-index" "$REPO/ksi-query" "$TOOL_DIR/"
+install -m 0755 "$REPO/ksi-index" "$REPO/ksi-query" "$REPO/tools/kiro-resume" "$TOOL_DIR/"
 install -m 0644 "$REPO"/ksi/*.py "$REPO"/ksi/*.sql "$TOOL_DIR/ksi/"
 
 # The entry points add their own directory to sys.path, so the package sits beside
@@ -79,7 +85,7 @@ mkdir -p "$SKILL_DIR"
 sed "s|@TOOL_DIR@|${TOOL_DIR/#$HOME/~}|g" "$REPO/skill/SKILL.md" > "$SKILL_DIR/SKILL.md"
 
 say "✓ installed to $SKILL_DIR"
-say "    SKILL.md, scripts/{ksi-index,ksi-query}, scripts/ksi/"
+say "    SKILL.md, scripts/{ksi-index,ksi-query,kiro-resume}, scripts/ksi/"
 
 # The point of the install is independence, so verify it rather than assume it.
 if grep -qF "$REPO" "$SKILL_DIR/SKILL.md"; then
@@ -88,13 +94,37 @@ fi
 if grep -q '@TOOL_DIR@' "$SKILL_DIR/SKILL.md"; then
     die "installed SKILL.md still contains an unsubstituted placeholder"
 fi
-for f in ksi-index ksi-query ksi/__init__.py ksi/index.py ksi/query.py ksi/text.py \
-         ksi/schema.sql; do
+for f in ksi-index ksi-query kiro-resume ksi/__init__.py ksi/index.py ksi/query.py \
+         ksi/text.py ksi/schema.sql; do
     [ -e "$TOOL_DIR/$f" ] || die "missing from install: $f"
 done
 # Import from a directory that is not the repo, so a stray relative path would fail here.
 (cd / && "$TOOL_DIR/ksi-query" --help >/dev/null) || die "installed ksi-query is not runnable"
 say "✓ verified: installed copy is self-contained"
+
+# PATH symlinks. kiro-resume is invoked by hand, so it is useless unless it is on
+# PATH; ksi-query is the other half of the same pair for hand use. ksi-index is left
+# out on purpose: every query refreshes the index already, so a manual rebuild is
+# rare enough to spell out in full.
+#
+# The symlink is what makes an in-process `import ksi` work from a PATH directory:
+# CPython resolves the link before computing sys.path[0], so the entry point still
+# sees the package sitting beside its real location.
+mkdir -p "$BIN_DIR" || die "cannot create $BIN_DIR"
+for tool in kiro-resume ksi-query; do
+    ln -sfn "$TOOL_DIR/$tool" "$BIN_DIR/$tool" \
+        || die "cannot link $BIN_DIR/$tool -> $TOOL_DIR/$tool"
+done
+say "✓ linked into $BIN_DIR: kiro-resume, ksi-query"
+
+# A tool that is installed but not runnable is worse than one that is absent, so
+# fail the whole install rather than warn. Run through the symlink, from an
+# unrelated directory, which is exactly how the user will invoke it.
+(cd / && "$BIN_DIR/kiro-resume" --help >/dev/null 2>&1) \
+    || die "$BIN_DIR/kiro-resume is not runnable through its symlink"
+say "✓ verified: kiro-resume runs through its symlink"
+
+command -v fzf >/dev/null 2>&1 || say "  note: fzf not found — kiro-resume will use a numbered menu"
 
 if [ "$DO_INDEX" -eq 1 ]; then
     say "building index (first run reads every session; later runs are incremental)…"
@@ -106,11 +136,12 @@ cat <<EOF
 
 Done. The skill is live; this repo is no longer needed at runtime.
 
-  $TOOL_DIR/ksi-query "记忆 遗忘"
-  $TOOL_DIR/ksi-query -t "connection refused"
-  $TOOL_DIR/ksi-query --status
+On PATH now:
+  kiro-resume              # pick a past session and resume it
+  kiro-resume -s 记忆      # ...find it by what was said in it first
+  ksi-query "记忆 遗忘"    # search without leaving your current session
+  ksi-query --status
 
-Optional -- put them on PATH (symlinks point at the installed copy, not the repo):
-  ln -sf "$TOOL_DIR/ksi-query" ~/.local/bin/ksi-query
-  ln -sf "$TOOL_DIR/ksi-index" ~/.local/bin/ksi-index
+Manual index rebuild, rarely needed (every query refreshes incrementally):
+  $TOOL_DIR/ksi-index --full
 EOF
