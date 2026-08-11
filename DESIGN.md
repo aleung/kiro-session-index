@@ -116,10 +116,16 @@ on a 986-session corpus, `pipeline` under LIMIT 300 surfaced 105 of the 189 matc
 sessions, and `session` 44 of 119. Roughly half the matching sessions were invisible.
 Aggregating without a limit is the fix; exact hit counts are a by-product, not the goal.
 
-Known blind spot: the fzf selection and the `exec` into `kiro-cli` are untested.
-Both replace or hand off the process, and a mock of either would assert only that the
-mock was called. Everything upstream of the selection is covered in
-`tests/test_resume.py`.
+Known blind spot: the `exec` into `kiro-cli` is untested. It replaces the process, and
+a mock of it would assert only that the mock was called.
+
+The picker *is* tested, because leaving it uncovered is where a real bug hid: fzf draws
+its interface on stderr and writes only the chosen line to stdout, so capturing stderr
+left it waiting for keystrokes with a blank screen — a hang, as far as the user can
+tell. No pipe-based test can see that; with both streams captured fzf either exits or
+looks fine. The test therefore drives the entry point under a pty, and sets an explicit
+window size on it, since a full-screen picker given zero rows and columns also draws
+nothing and would make the test pass or fail for the wrong reason.
 
 ## Session log data shapes
 

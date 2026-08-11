@@ -7,16 +7,18 @@ Three layers, per the design decisions behind this module:
   * the failure contract -- searching without a usable index must be loud and
     non-zero, never a quiet downgrade.
 
-fzf selection and the exec into kiro-cli are deliberately not covered: both
-replace or hand off the process. That is a known blind spot, recorded in
-DESIGN.md rather than papered over with a mock that proves nothing.
+Plus the picker, under a pty. That one was originally left out as untestable, which
+is precisely where a hang got through: see TestSelectionReachesTheTerminal. Only the
+exec into kiro-cli remains uncovered, since it replaces the process.
 """
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -322,5 +324,68 @@ class TestFailureContract(unittest.TestCase):
             self.assertIn("unrecognized arguments", proc.stderr)
 
 
+class TestSelectionReachesTheTerminal(unittest.TestCase):
+    """The picker must actually appear.
+
+    fzf draws its interface on stderr and writes only the chosen line to stdout.
+    Capturing stderr therefore produces a process that waits for keystrokes with a
+    blank screen -- a hang, as far as the user can tell. Nothing short of a real
+    terminal catches that: with stdout and stderr both pipes, fzf either fails
+    outright or looks fine.
+
+    So this drives the entry point under a pty and asserts that something renders.
+    """
+
+    @unittest.skipUnless(shutil.which("fzf"), "fzf not installed")
+    def test_picker_renders_within_a_couple_of_seconds(self):
+        import fcntl
+        import pty
+        import select
+        import struct
+        import termios
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = sidecars(os.path.join(tmp.name, "cli"),
+                        [spec("a", cwd="/", title="a listable session")])
+
+        master, slave = pty.openpty()
+        # openpty leaves the window 0x0, and a full-screen picker given no rows and
+        # no columns draws nothing at all -- which would make this test pass or fail
+        # for reasons unrelated to what it is checking.
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        env = dict(os.environ)
+        env.pop("PYTHONPATH", None)
+        env["TERM"] = "xterm"
+        proc = subprocess.Popen(
+            [sys.executable, ENTRY, "--sessions", root, "-n", "3"],
+            stdin=slave, stdout=slave, stderr=slave, cwd="/", env=env)
+        os.close(slave)
+
+        def cleanup():
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+            os.close(master)
+        self.addCleanup(cleanup)
+
+        seen = b""
+        deadline = time.time() + 5
+        while time.time() < deadline and b"resume session" not in seen:
+            if select.select([master], [], [], 0.2)[0]:
+                try:
+                    seen += os.read(master, 4096)
+                except OSError:
+                    break
+
+        self.assertIn(b"resume session", seen,
+                      "the picker never rendered; fzf's UI is being swallowed")
+
+
 if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+
+
+
     unittest.main(verbosity=2)

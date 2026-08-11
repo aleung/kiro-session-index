@@ -202,11 +202,15 @@ def _choose(display):
     """
     if shutil.which("fzf"):
         payload = "\n".join(f"{i}\x1f{line}" for i, line in enumerate(display))
+        # stdout only. fzf draws its interface on stderr and writes just the chosen
+        # line to stdout -- that split is what lets its output be piped. Capturing
+        # stderr here leaves fzf waiting for keystrokes with nothing on screen, which
+        # to the user is indistinguishable from a hang.
         proc = subprocess.run(
             ["fzf", "--ansi", "--no-sort", "--prompt=resume session> ",
              "--header=Select a session to resume (Esc to cancel)",
              "--delimiter=\x1f", "--with-nth=2"],
-            input=payload, capture_output=True, text=True)
+            input=payload, stdout=subprocess.PIPE, text=True)
         if proc.returncode != 0 or not proc.stdout.strip():
             return None
         try:
