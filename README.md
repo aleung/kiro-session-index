@@ -6,7 +6,7 @@
 - [Install](#install)
 - [Use](#use)
   - [Go back into a session](#go-back-into-a-session)
-  - [Search without leaving your current session](#search-without-leaving-your-current-session)
+  - [Recover a past decision without leaving this session](#recover-a-past-decision-without-leaving-this-session)
   - [Which mode to use](#which-mode-to-use)
   - [Search syntax](#search-syntax)
   - [Narrowing results](#narrowing-results)
@@ -23,13 +23,15 @@ Search your past Kiro CLI sessions, and go back into them.
 Every conversation, command, and error you have had with the agent, indexed and queryable —
 so you can recover *why* something was decided, not just what a summary says about it.
 
-Two tools over one corpus, because there are two things you want from a session you
-half-remember:
+Two ways in, because there are two things you want from a session you half-remember:
 
-| You want | Tool |
+| You want | How |
 |---|---|
-| The decision quoted back into what you are doing now | `ksi-query`, or just ask the agent |
-| To go back into that session and carry on | `kiro-resume` |
+| The decision quoted back into what you are doing now | ask the agent — the `session-history` skill lets it search your history on its own |
+| To go back into that session and carry on | run `kiro-resume` |
+
+Under both sits one index and one CLI, `ksi-query`. The skill drives it for the agent;
+you can also run it by hand when you would rather search without involving the agent.
 
 Handles Chinese, English, and code. Python3 stdlib only — no packages to install.
 (`kiro-resume` also wants `kiro-cli` itself, and will use `fzf` for selection if you
@@ -41,9 +43,9 @@ have it.)
 ./setup.sh
 ```
 
-Builds the index, installs a `session-history` skill so the agent can search your
-history on its own when you ask "did we discuss this before?", and puts `kiro-resume`
-and `ksi-query` on your PATH via `~/bin`.
+Builds the index, installs the `session-history` skill so the agent can search your
+history on its own, and puts `kiro-resume` on your PATH via `~/bin` — plus `ksi-query`,
+for the times you want to search by hand.
 
 After setup this repo is not needed at runtime — everything is copied into the skill
 directory, and the PATH symlinks point at that copy. Re-run `setup.sh` after pulling
@@ -85,7 +87,13 @@ Listing does not need the index and works even if you have never built one. `-s`
 and will build it if missing; if it cannot, it says so and exits non-zero rather than
 quietly searching worse.
 
-### Search without leaving your current session
+### Recover a past decision without leaving this session
+
+Just ask. The `session-history` skill triggers on questions like "did we discuss this
+before?", "之前讨论过吗", or a reference to earlier work the agent has no context for.
+It searches the index and quotes back what was actually said, with a citation.
+
+The same search by hand, when you would rather not involve the agent:
 
 ```bash
 ksi-query "记忆 遗忘"              # search what was said
@@ -99,9 +107,9 @@ quote back.
 
 ### Which mode to use
 
-| You want | Command |
+| You want | How |
 |---|---|
-| A past discussion or decision | `ksi-query` |
+| A past discussion or decision | ask the agent, or `ksi-query` by hand |
 | To reopen that session and carry on | `kiro-resume -s` |
 | An error or command output you saw before | `ksi-query -t` |
 | A fragment inside an identifier, like `UserName` in `getUserName` | `ksi-query -l` |
