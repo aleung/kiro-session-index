@@ -505,8 +505,12 @@ class TestSelectionReachesTheTerminal(unittest.TestCase):
         resumes nothing. The picker's item total is what tells the two apart -- one
         matching session must count as one item, not two.
         """
-        seen = self._render(["记忆"], corpus=True,
-                            ready=lambda s: self._item_totals(s))
+        seen = self._render(
+            ["记忆"], corpus=True,
+            # Both conditions, or this races the paint order: the item total can
+            # appear a frame before the rows are drawn, and waiting on either alone
+            # makes the result depend on which frame arrived first.
+            ready=lambda s: b"FTS" in s and self._item_totals(s))
         self.assertIn(b"resume session", seen, "the picker never rendered")
         self.assertIn(b"FTS", seen,
                       "the snippet line did not render; only titles reached fzf")

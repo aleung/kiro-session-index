@@ -310,8 +310,14 @@ def _choose(display):
         # line to stdout -- that split is what lets its output be piped. Capturing
         # stderr here leaves fzf waiting for keystrokes with nothing on screen, which
         # to the user is indistinguishable from a hang.
+        # No --gap. In fzf 0.67 a gap is drawn as a dashed rule, and it costs a screen
+        # row per session -- 7 sessions visible in a 24-row terminal instead of 10.
+        # Nothing is lost by removing it: the snippet is indented and dimmed, and the
+        # current-item highlight covers both of an entry's lines, so which line belongs
+        # to which session stays unambiguous. (--gap=1 --gap-line= keeps the blank row
+        # without the rule, if the density ever turns out to be too tight.)
         proc = subprocess.run(
-            ["fzf", "--ansi", "--read0", "--no-sort", "--gap=1",
+            ["fzf", "--ansi", "--read0", "--no-sort",
              "--prompt=resume session> ",
              "--header=Select a session to resume (Esc to cancel)",
              "--delimiter=\x1f", "--with-nth=2.."],
