@@ -25,6 +25,10 @@ EXPECTED = [
     "scripts/ksi/__init__.py",
     "scripts/ksi/index.py",
     "scripts/ksi/query.py",
+    # Carried by the skill payload but never imported by the agent: the human-facing
+    # tool shares the package, which was the accepted cost of one package rather
+    # than two copies of it.
+    "scripts/ksi/resume.py",
     "scripts/ksi/text.py",
     "scripts/ksi/schema.sql",
 ]

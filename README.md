@@ -5,6 +5,8 @@
 
 - [Install](#install)
 - [Use](#use)
+  - [Go back into a session](#go-back-into-a-session)
+  - [Search without leaving your current session](#search-without-leaving-your-current-session)
   - [Which mode to use](#which-mode-to-use)
   - [Search syntax](#search-syntax)
   - [Narrowing results](#narrowing-results)
@@ -17,11 +19,21 @@
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
-Search your past Kiro CLI sessions.
+Search your past Kiro CLI sessions, and go back into them.
 Every conversation, command, and error you have had with the agent, indexed and queryable —
 so you can recover *why* something was decided, not just what a summary says about it.
 
-Handles Chinese, English, and code. Zero dependencies: python3 stdlib only.
+Two tools over one corpus, because there are two things you want from a session you
+half-remember:
+
+| You want | Tool |
+|---|---|
+| The decision quoted back into what you are doing now | `ksi-query`, or just ask the agent |
+| To go back into that session and carry on | `kiro-resume` |
+
+Handles Chinese, English, and code. Python3 stdlib only — no packages to install.
+(`kiro-resume` also wants `kiro-cli` itself, and will use `fzf` for selection if you
+have it.)
 
 ## Install
 
@@ -29,28 +41,51 @@ Handles Chinese, English, and code. Zero dependencies: python3 stdlib only.
 ./setup.sh
 ```
 
-Builds the index and installs a `session-history` skill, so the agent can search your
-history on its own when you ask "did we discuss this before?".
+Builds the index, installs a `session-history` skill so the agent can search your
+history on its own when you ask "did we discuss this before?", and puts `kiro-resume`
+and `ksi-query` on your PATH via `~/bin`.
 
 After setup this repo is not needed at runtime — everything is copied into the skill
-directory. Re-run `setup.sh` after pulling changes.
+directory, and the PATH symlinks point at that copy. Re-run `setup.sh` after pulling
+changes.
 
 ```bash
 ./setup.sh --no-index         # install without building the index
-./setup.sh --skill-dir DIR    # install somewhere else
+./setup.sh --skill-dir DIR    # install the skill somewhere else
+./setup.sh --bin-dir DIR      # put the symlinks somewhere other than ~/bin
 ```
 
-Optionally put the tools on your PATH:
-
-```bash
-ln -sf ~/.kiro/skills/session-history/scripts/ksi-query ~/.local/bin/ksi-query
-ln -sf ~/.kiro/skills/session-history/scripts/ksi-index ~/.local/bin/ksi-index
-```
+An existing `kiro-resume` or `ksi-query` in the target directory is replaced.
+`ksi-index` is deliberately not linked: every query refreshes the index already, so a
+manual rebuild is rare enough to spell out in full.
 
 ## Use
 
-Examples below use the short names, which assume the symlinks above.
+Examples below use the short names, which `setup.sh` puts on your PATH.
 Without them, use the full path `~/.kiro/skills/session-history/scripts/ksi-query`.
+
+### Go back into a session
+
+```bash
+kiro-resume                  # sessions started in this directory, newest first
+kiro-resume --all-dirs       # from everywhere
+kiro-resume -s "遗忘机制"     # only sessions that discussed it (implies --all-dirs)
+kiro-resume -n 40            # a longer list
+```
+
+Pick one and it resumes, changing directory to wherever that session was working.
+Selection uses `fzf` when you have it, a numbered menu otherwise.
+
+`-s` shows a hit count per session, and sorts sessions that matched a lot ahead of
+ones that barely did, so an old session about your topic is not buried under recent
+ones that mention it once. Sub-agent sessions are never listed or searched — every
+turn in them was written by the agent, not by you.
+
+Listing does not need the index and works even if you have never built one. `-s` does,
+and will build it if missing; if it cannot, it says so and exits non-zero rather than
+quietly searching worse.
+
+### Search without leaving your current session
 
 ```bash
 ksi-query "记忆 遗忘"              # search what was said
@@ -66,9 +101,10 @@ quote back.
 
 | You want | Command |
 |---|---|
-| A past discussion or decision | default |
-| An error or command output you saw before | `-t` |
-| A fragment inside an identifier, like `UserName` in `getUserName` | `-l` |
+| A past discussion or decision | `ksi-query` |
+| To reopen that session and carry on | `kiro-resume -s` |
+| An error or command output you saw before | `ksi-query -t` |
+| A fragment inside an identifier, like `UserName` in `getUserName` | `ksi-query -l` |
 | The contents of a file that still exists | none of these — use ripgrep |
 
 ### Search syntax
@@ -106,11 +142,11 @@ ksi-query --sql "SELECT s.created_at, s.title, t.path
 Nothing to do — every query checks the source logs first and updates what changed,
 which takes about 0.3 s. The session you are in right now is searchable within seconds.
 
-To refresh or rebuild by hand:
+To refresh or rebuild by hand — `ksi-index` is not on your PATH, so spell it out:
 
 ```bash
-ksi-index          # refresh
-ksi-index --full   # rebuild from scratch, ~3 s
+~/.kiro/skills/session-history/scripts/ksi-index          # refresh
+~/.kiro/skills/session-history/scripts/ksi-index --full   # rebuild, ~3 s
 ```
 
 ## Where things live
@@ -119,6 +155,7 @@ ksi-index --full   # rebuild from scratch, ~3 s
 |---|---|
 | The index | `~/.cache/kiro-session-index/` |
 | Installed tools and skill | `~/.kiro/skills/session-history/` |
+| `kiro-resume`, `ksi-query` on PATH | `~/bin/` (symlinks into the above) |
 | Your session logs (read-only) | `~/.kiro/sessions/cli/` |
 
 The index is a cache. Deleting it is safe — the next query rebuilds it from your logs,
@@ -136,8 +173,16 @@ Nothing is ever sent anywhere.
 ## Troubleshooting
 
 **A search returns nothing but you are sure you discussed it.**
-Try the other corpus (`-t`), then `-l`, then a different wording.
+Try the other corpus (`ksi-query -t`), then `ksi-query -l`, then a different wording.
 The conversation may have used different words than your query.
+
+**`kiro-resume -s` says it cannot search the index.**
+Plain `kiro-resume` still lists your sessions — listing never touches the index.
+Rebuild with `~/.kiro/skills/session-history/scripts/ksi-index --full`.
+
+**`kiro-resume` does not list a session you remember.**
+Sub-agent sessions are excluded on purpose: nothing in them was written by you.
+Sessions from other directories need `--all-dirs`.
 
 **`ksi-index` exits non-zero.**
 It names the sessions it could not index; the rest of the index is still current.

@@ -5,6 +5,7 @@
 
 - [Premise](#premise)
 - [Layout](#layout)
+- [Two delivery channels](#two-delivery-channels)
 - [Session log data shapes](#session-log-data-shapes)
 - [Data model](#data-model)
 - [Key design choices](#key-design-choices)
@@ -41,18 +42,84 @@ because a search that silently returns nothing reads as "this never happened".
 ## Layout
 
 ```
-ksi/text.py     query/index transforms, snippet extraction
-ksi/index.py    parsing, incremental update, integrity
-ksi/query.py    the single SQL entry point and its guards
-ksi/schema.sql  schema, with rationale in comments
-ksi-index       CLI: build/refresh
-ksi-query       CLI: search
-skill/SKILL.md  agent-facing reference, @TOOL_DIR@ substituted at install
-setup.sh        installs a self-contained copy; repo unused at runtime
+ksi/text.py        query/index transforms, snippet extraction
+ksi/index.py       parsing, incremental update, integrity
+ksi/query.py       the single SQL entry point and its guards
+ksi/resume.py      session listing and selection, for the human-facing tool
+ksi/schema.sql     schema, with rationale in comments
+ksi-index          CLI: build/refresh
+ksi-query          CLI: search
+tools/kiro-resume  CLI: pick a past session and go back into it
+skill/SKILL.md     agent-facing reference, @TOOL_DIR@ substituted at install
+setup.sh           installs a self-contained copy; repo unused at runtime
+scripts/           repo maintenance, not shipped
 ```
+
+Three locations, three meanings, easy to blur:
+the repo root holds the entry points the *agent* reaches through the skill,
+`tools/` holds the ones a *person* invokes by hand,
+and `scripts/` holds repo maintenance that ships nowhere.
+Note that `scripts` is already overloaded — inside the install it is where the
+shipped code lands, which is the opposite of what it means here.
 
 The skill is named `session-history`, not after the repo:
 skill names are matched against user intent, and the user asks about session history.
+
+## Two delivery channels
+
+The index has two kinds of consumer, and they want opposite things done with the
+same answer.
+The agent reaches `ksi-query` through the skill to pull a past decision *into* the
+current session.
+A person runs `kiro-resume` to go *back into* the session that decision was made in.
+Same corpus, same entry question — "I remember working on X" — different exit.
+
+Both channels install into `$SKILL_DIR/scripts/`, which is therefore better read as
+"the installed code directory" than as "the skill's private directory";
+`kiro-resume` lives there because it must sit beside the `ksi` package to import it,
+and is reached through a symlink on PATH.
+The symlink is load-bearing rather than cosmetic:
+CPython resolves it before computing `sys.path[0]`,
+so the entry point finds the package beside its real location, not beside the link.
+
+Three consequences of the Premise show up in `kiro-resume` specifically,
+and each one looks like a candidate for simplification until you remember why:
+
+**The session list comes from the `.json` sidecars, not from the `sessions` table.**
+The sidecars are the source of truth for which sessions exist;
+the table is populated only while parsing a `.jsonl`,
+so a session with no messages yet has no row.
+Listing from the cache would mean a cold or partial index hides sessions from a
+launcher, which is the one thing a launcher may not do.
+Only `-s` opens the index at all.
+
+**Searching fails loudly instead of degrading.**
+It used to fall back to grepping the raw logs when the index was unreachable.
+That fallback cannot match inside a CJK word (the tokenizer needs `text.py`'s
+splitting) nor inside an identifier,
+so it answered "nothing found" for topics that had been discussed at length —
+retrieval failing silently, in the exact shape the Premise warns about.
+
+**Sub-agent sessions are excluded from both listing and search.**
+Every `user` turn inside one was written by the orchestrator, not by a person:
+across 299 sub-agent sessions, 55% of the prose is tool-call purposes and the rest
+is execution reporting.
+The cost was measured before removing it — for five representative terms, dropping
+the roll-up to parents made between 0 and 6 sessions unfindable out of 21 to 138
+matching, because a delegating session almost always states the task in its own
+prose first.
+
+`ksi/query.py:count_by_session` exists for the same reason the third point was
+measurable. The `search_*` functions take a *global* LIMIT ordered by rank, which
+answers "show me the best snippets" and not "which sessions mention this":
+on a 986-session corpus, `pipeline` under LIMIT 300 surfaced 105 of the 189 matching
+sessions, and `session` 44 of 119. Roughly half the matching sessions were invisible.
+Aggregating without a limit is the fix; exact hit counts are a by-product, not the goal.
+
+Known blind spot: the fzf selection and the `exec` into `kiro-cli` are untested.
+Both replace or hand off the process, and a mock of either would assert only that the
+mock was called. Everything upstream of the selection is covered in
+`tests/test_resume.py`.
 
 ## Session log data shapes
 
