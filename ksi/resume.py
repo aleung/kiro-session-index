@@ -21,6 +21,20 @@ Every `user` turn inside one was written by the orchestrator, not by a person:
 measured over 299 sub-agent sessions, 55% of their prose is tool-call purposes
 and the rest is execution reporting. Searching them answers a question nobody
 asked -- "what did a delegate report" -- when the question is "what did I discuss".
+
+Tool output is excluded too, for the same reason one step further out: a command
+that printed a word is not a discussion of it. It is not a small effect --
+`pipeline` matches 139 sessions in prose and another 134 in command output alone,
+`connection` 47 and 81 -- so including it roughly doubles the list with sessions
+that merely logged the word, and a log that repeated it 400 times would sort
+straight to the top. `ksi-query -t` is where that corpus belongs.
+
+Searching shows a matched sentence under each session, because the title cannot
+answer the question being asked of it. Titles are the opening prompt truncated to
+about 50 characters, so they describe how a session *started*, and the thing you
+searched for usually came up later: of the sessions matching `记忆` 0 of 16 had
+the term in the title, `pipeline` 6 of 139, `vulnerability` 0 of 55. A list of
+titles is a list of near-random labels with respect to the query.
 """
 
 import argparse
@@ -28,6 +42,7 @@ import calendar
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -36,12 +51,31 @@ import unicodedata
 
 from . import index as I
 from . import query as Q
+from . import text as T
 
-# Hits at or above this sort ahead of everything else, and within each band the
-# order stays chronological. Sorting purely by recency buries an old session that
-# matched 200 times under new ones that matched once; sorting purely by hit count
-# breaks the common case, which is "carry on with yesterday's work".
-BAND_THRESHOLD = 5
+# How much context T.snip keeps either side of the match, in characters. 30 is where
+# "as much context as possible" meets "the matched word always survives the cut":
+# snip counts characters while the terminal counts columns, so a CJK snippet occupies
+# twice the width of an ASCII one at the same setting. Measured against the corpus, 20
+# and 30 kept the matched term visible in every matching session; 40 lost it in 1 of
+# 55 for `vulnerability`, which shows up as a word sliced in half at the right margin.
+SNIP_WIDTH = 30
+
+# Rows shown before the picker opens. Searching gets a bigger budget because the cut
+# happens *before* fzf sees the list, so anything past it cannot be reached by typing
+# either -- and a search can easily match 139 sessions. Listing stays small: it is
+# ordered by recency, so the tail is not what you came for.
+DEFAULT_LIMIT_LIST = 20
+DEFAULT_LIMIT_SEARCH = 50
+
+SNIPPET_INDENT = "    "
+
+# Intensity, not colour. UNDIM is SGR 22 ("normal intensity"), which is why the
+# matched term is marked by clearing the dim rather than by adding bold -- see
+# mark_terms.
+DIM = "\033[2m"
+UNDIM = "\033[22m"
+RESET = "\033[0m"
 
 
 def load_sessions(sessions_dir=None):
@@ -112,27 +146,75 @@ def truncate(s, max_w):
     return "".join(out) + "…"
 
 
-def count_hits(keyword, db=None, sessions_dir=None):
-    """{session_id: hits} across conversation prose and tool output.
+def project_of(cwd):
+    """Just the last path component -- the project, not the route to it.
+
+    In search mode the row has a matched sentence to carry, so the directory column
+    earns only what it needs to answer "which project": a two-component path costs
+    another ~20 columns and pushes the title into being sliced mid-word.
+    """
+    return os.path.basename((cwd or "").rstrip("/"))
+
+
+def build_query(terms):
+    """Command-line words to one full-text query string.
+
+    Multiple words become AND, which is what build_match does with them. A single
+    argument containing a space becomes a phrase, so the rule you have to remember
+    is the shell's, not FTS5's: `kiro-resume 遗忘 机制` is two terms,
+    `kiro-resume "遗忘 机制"` is a phrase.
+    """
+    return " ".join(f'"{t}"' if " " in t else t for t in terms)
+
+
+def search_sessions(query, db=None, sessions_dir=None):
+    """{session_id: {"hits": int, "snippet": str}} for everything that matches.
 
     Refreshes the index first, and lets any failure propagate: the caller turns it
     into a loud error rather than a degraded search.
     """
     con, _refreshed = Q.open_index(db, auto_update=True, sessions_dir=sessions_dir)
     try:
-        hits = Q.count_by_session(con, keyword)
-        for sid, n in Q.count_by_session(con, keyword, tool_output=True).items():
-            hits[sid] = hits.get(sid, 0) + n
-        return hits
+        return Q.sessions_matching(con, query, snip_width=SNIP_WIDTH)
     finally:
         con.close()
 
 
-def list_sessions(sessions, cwd=None, all_dirs=False, hits=None, limit=20):
-    """Resumable sessions, newest first, as display-ready rows.
+def mark_terms(text, terms, color=False):
+    """Dim the whole snippet, at normal intensity only where the query matched.
 
-    Sub-agent sessions never appear. When `hits` is given, only sessions with a
-    hit appear, and the high-hit band sorts first.
+    Contrast comes from *removing* the dim rather than adding bold: ANSI keeps bold
+    and faint in one intensity slot and SGR 22 clears both, so bold nested inside
+    faint is undefined and terminals disagree about it. Un-dimming has one meaning
+    everywhere.
+
+    One pass over a combined pattern, not one pass per term: replacing term by term
+    would let a later term match the digits inside an escape code already inserted.
+    """
+    if not color:
+        return text
+    wanted = [t for t in dict.fromkeys(terms) if t]
+    if not wanted:
+        return DIM + text + RESET
+    pattern = re.compile("|".join(re.escape(t) for t in wanted), re.IGNORECASE)
+    return DIM + pattern.sub(lambda m: UNDIM + m.group(0) + DIM, text) + RESET
+
+
+
+def list_sessions(sessions, cwd=None, all_dirs=False, matches=None, limit=20):
+    """Resumable sessions as display-ready rows.
+
+    Sub-agent sessions never appear. When `matches` is given, only sessions that
+    matched appear, ordered by hit count and then recency; without it the order is
+    purely recency.
+
+    The two orders reflect two intents. Bare `kiro-resume` means "carry on with
+    yesterday's work", where recent is what you want. `kiro-resume <words>` means
+    "find the one about this", where relevance is. An earlier version served both at
+    once by banding hit counts, a compromise made when the row showed nothing but a
+    title; with a matched sentence on every row you can judge relevance yourself, and
+    the banding was degenerate anyway -- prose-only counts have a median of 1 to 2, so
+    for most queries nobody reached the band at all.
     """
     rows = []
     for sid, meta in sessions.items():
@@ -140,10 +222,11 @@ def list_sessions(sessions, cwd=None, all_dirs=False, hits=None, limit=20):
             continue
         if not all_dirs and meta.get("cwd") != cwd:
             continue
-        if hits is not None and sid not in hits:
+        match = matches.get(sid) if matches is not None else None
+        if matches is not None and match is None:
             continue
-        n = hits.get(sid, 0) if hits else 0
         updated = meta.get("updated_at") or ""
+        snippet = (match["snippet"] if match else "") or ""
         rows.append({
             "session_id": sid,
             "updated_at": updated,
@@ -151,22 +234,32 @@ def list_sessions(sessions, cwd=None, all_dirs=False, hits=None, limit=20):
             "title": (meta.get("title") or "(untitled)").replace("\t", " ")
                                                         .replace("\n", " "),
             "cwd": meta.get("cwd") or "",
-            "hits": n,
+            "hits": match["hits"] if match else 0,
+            "snippet": snippet.replace("\t", " ").replace("\n", " "),
         })
-    rows.sort(key=lambda r: (1 if r["hits"] >= BAND_THRESHOLD else 0, r["updated_at"]),
-              reverse=True)
+    if matches is not None:
+        rows.sort(key=lambda r: (r["hits"], r["updated_at"]), reverse=True)
+    else:
+        rows.sort(key=lambda r: r["updated_at"], reverse=True)
     return rows[:limit]
 
 
-def format_rows(rows, cols=100, show_cwd=False, show_hits=False, color=False):
-    """One display line per row: age, optional hit count, optional cwd, then title.
+def format_rows(rows, cols=100, show_cwd=False, searching=False, terms=(),
+                color=False):
+    """One item per row; searching makes each item two lines.
 
-    The title takes whatever width is left, so the fixed columns are budgeted
-    first. Widths are counted in display columns, not characters, or a CJK title
-    wraps and the list stops being scannable.
+    First line: age, hit count, project, title. Second line, indented: the sentence
+    the match was found in. Two lines rather than one because on one line they compete
+    for the same ~54 columns left after the fixed fields, and neither survives it.
+    The title alone cannot do this job -- it is the opening prompt truncated, so it
+    describes how the session started, not why it matched.
+
+    Widths are display columns, not characters, or a CJK row wraps and the list stops
+    being scannable. The snippet is cut the same way; the match sits at its centre, so
+    a cut costs trailing context rather than the thing you were looking for.
     """
     if color:
-        dim, cyan, yellow, reset = "\033[2m", "\033[36m", "\033[33m", "\033[0m"
+        dim, cyan, yellow, reset = DIM, "\033[36m", "\033[33m", RESET
     else:
         dim = cyan = yellow = reset = ""
 
@@ -176,17 +269,24 @@ def format_rows(rows, cols=100, show_cwd=False, show_hits=False, color=False):
         used = 10
         age_part = f"{dim}{r['age']:<8s}  {reset}"
         hits_part = ""
-        if show_hits:
+        if searching:
             shown = (str(r["hits"]) + "x").rjust(5) + " "
             used += len(shown)
             hits_part = f"{yellow}{shown}{reset}"
         cwd_part = ""
-        if show_cwd:
-            shown = short_path(r["cwd"]) + "  "
+        if searching or show_cwd:
+            # Searching spends the width on the snippet instead, so the directory
+            # column shrinks to the project name -- enough to answer "which one".
+            shown = (project_of(r["cwd"]) if searching else short_path(r["cwd"])) + "  "
             used += display_width(shown)
             cwd_part = f"{cyan}{shown}{reset}"
-        out.append(age_part + hits_part + cwd_part
-                   + truncate(r["title"], max(avail - used, 10)))
+        item = (age_part + hits_part + cwd_part
+                + truncate(r["title"], max(avail - used, 10)))
+        if searching and r.get("snippet"):
+            room = max(cols - display_width(SNIPPET_INDENT) - 4, 20)
+            item += "\n" + SNIPPET_INDENT + mark_terms(truncate(r["snippet"], room),
+                                                       terms, color)
+        out.append(item)
     return out
 
 
@@ -195,21 +295,26 @@ def format_rows(rows, cols=100, show_cwd=False, show_hits=False, color=False):
 def _choose(display):
     """Index of the row the user picked, or None if they cancelled.
 
-    Rows are handed to fzf as "<index>\x1f<display>" and only field 2 is shown.
-    The separator is deliberately a control character: titles routinely contain
-    the box-drawing and pipe characters that an earlier version used, which made
-    the parse depend on the content it was parsing.
+    Items are handed over as "<index>\x1f<item>" with only field 2 onward shown, and
+    NUL-separated via --read0 so that an item may contain a newline and still be one
+    entry. The field separator is deliberately a control character: titles routinely
+    contain the pipe and box-drawing characters an earlier version used, which made
+    the parse depend on the content being parsed.
+
+    Typing filters against both lines, so a word you remember from the matched
+    sentence narrows the list too, not just a word from the title.
     """
     if shutil.which("fzf"):
-        payload = "\n".join(f"{i}\x1f{line}" for i, line in enumerate(display))
+        payload = "".join(f"{i}\x1f{item}\x00" for i, item in enumerate(display))
         # stdout only. fzf draws its interface on stderr and writes just the chosen
         # line to stdout -- that split is what lets its output be piped. Capturing
         # stderr here leaves fzf waiting for keystrokes with nothing on screen, which
         # to the user is indistinguishable from a hang.
         proc = subprocess.run(
-            ["fzf", "--ansi", "--no-sort", "--prompt=resume session> ",
+            ["fzf", "--ansi", "--read0", "--no-sort", "--gap=1",
+             "--prompt=resume session> ",
              "--header=Select a session to resume (Esc to cancel)",
-             "--delimiter=\x1f", "--with-nth=2"],
+             "--delimiter=\x1f", "--with-nth=2.."],
             input=payload, stdout=subprocess.PIPE, text=True)
         if proc.returncode != 0 or not proc.stdout.strip():
             return None
@@ -218,8 +323,11 @@ def _choose(display):
         except ValueError:
             return None
 
-    for i, line in enumerate(display, start=1):
-        print(f"{i:2d}  {line}")
+    for i, item in enumerate(display, start=1):
+        first, _, rest = item.partition("\n")
+        print(f"{i:2d}  {first}")
+        if rest:
+            print(rest)
     print()
     try:
         raw = input("Number to resume (blank to cancel): ").strip()
@@ -252,27 +360,53 @@ def _resume(row):
 # ------------------------------------------------------------------ entry point
 
 _EPILOG = """\
-KEYWORD is full-text syntax: `a b` = both, `"a b"` = phrase, `a*` = prefix,
-`a -b` = a without b. Chinese matches inside words, so 忘机 finds 遗忘机制.
+examples:
+  kiro-resume                    sessions from this directory, newest first
+  kiro-resume 记忆               sessions that discussed it, most matches first
+  kiro-resume 记忆 遗忘          both words present
+  kiro-resume "遗忘 机制"        that exact phrase
+  kiro-resume 'token*'          words starting with token -- quoted, or the shell
+                                expands it against your filenames first
+  kiro-resume -- memory -pipeline
+                                the first word, without the second
 
-Sub-agent sessions are never listed or searched -- they contain no words of
-yours. Searching needs the index and will build it if missing; listing does not
-touch the index at all.
+Searching implies --all-dirs, and shows the sentence each match was found in.
+Only your side of the conversation is searched: not command output (use
+`ksi-query -t`), and not sub-agent sessions, which contain no words of yours.
+Searching needs the index and will build it if missing; listing does not touch it.
 """
 
 
+class _Parser(argparse.ArgumentParser):
+    """Turns the one confusing failure into a pointed one.
+
+    `kiro-resume memory -pipeline` is a reasonable thing to type -- `-pipeline` is
+    how full-text search spells "without this word" -- but to a command line it
+    looks like an option name, and the stock message says only "unrecognized
+    arguments", which does not tell you what to do about it.
+    """
+
+    def error(self, message):
+        if "unrecognized arguments" in message and re.search(r"(^|\s)-\w", message):
+            message += ("\nto search for a word without another, put the terms "
+                        "after --:  kiro-resume -- memory -pipeline")
+        super().error(message)
+
+
 def main(argv=None):
-    p = argparse.ArgumentParser(
+    p = _Parser(
         prog="kiro-resume",
-        description="List recent Kiro sessions for this directory and resume one.",
+        description="List recent Kiro sessions and resume one. "
+                    "With words, only sessions that discussed them.",
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("-n", "--limit", type=int, default=20,
-                   help="show at most N sessions (default 20)")
+    p.add_argument("terms", nargs="*", metavar="WORD",
+                   help="search terms; several mean all of them must appear")
+    p.add_argument("-n", "--limit", type=int, default=None,
+                   help=f"show at most N sessions (default {DEFAULT_LIMIT_LIST}, "
+                        f"or {DEFAULT_LIMIT_SEARCH} when searching)")
     p.add_argument("--all-dirs", action="store_true",
                    help="sessions from every directory, not just this one")
-    p.add_argument("-s", "--search", metavar="KEYWORD",
-                   help="only sessions whose content matches; implies --all-dirs")
     p.add_argument("--sessions", help="source directory of session logs")
     p.add_argument("--db", help="index path (default ~/.cache/kiro-session-index)")
     args = p.parse_args(argv)
@@ -282,11 +416,16 @@ def main(argv=None):
         print(f"error: no session directory at {sessions_dir}", file=sys.stderr)
         return 2
 
-    hits = None
-    if args.search:
+    searching = bool(args.terms)
+    query = build_query(args.terms) if searching else ""
+    limit = args.limit if args.limit is not None else (
+        DEFAULT_LIMIT_SEARCH if searching else DEFAULT_LIMIT_LIST)
+
+    matches = None
+    if searching:
         args.all_dirs = True
         try:
-            hits = count_hits(args.search, db=args.db, sessions_dir=args.sessions)
+            matches = search_sessions(query, db=args.db, sessions_dir=args.sessions)
         except Exception as e:
             # Loud, and non-zero. The alternative -- grepping the raw logs -- cannot
             # match inside CJK words or identifiers, so it would answer "nothing
@@ -297,27 +436,29 @@ def main(argv=None):
             return 1
 
     rows = list_sessions(load_sessions(sessions_dir), cwd=os.getcwd(),
-                         all_dirs=args.all_dirs, hits=hits, limit=args.limit)
+                         all_dirs=args.all_dirs, matches=matches, limit=limit)
 
     if not rows:
-        if args.search:
-            print(f"No sessions matching: {args.search}")
-            print('(full-text syntax: one word, "a phrase", or a prefix like term*)')
+        if searching:
+            print(f"No sessions matching: {query}")
+            print('(several words mean all must appear; "quote" a phrase; '
+                  'term* is a prefix)')
         else:
             print(f"No sessions for {os.getcwd()}")
-            print("(--all-dirs for every directory, -s KEYWORD to search content)")
+            print("(--all-dirs for every directory, or add words to search content)")
         return 0
 
     display = format_rows(
         rows,
         cols=shutil.get_terminal_size((100, 24)).columns,
         show_cwd=args.all_dirs,
-        show_hits=bool(args.search),
+        searching=searching,
+        terms=T.query_terms(query) if searching else (),
         # stderr, not stdout: stdout may be a pipe while the user still has a tty.
         color=sys.stderr.isatty())
 
-    if args.search:
-        print(f"Sessions matching '{args.search}':\n")
+    if searching:
+        print(f"Sessions matching {query}:\n")
 
     picked = _choose(display)
     if picked is None:

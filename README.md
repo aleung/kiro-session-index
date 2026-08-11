@@ -71,21 +71,39 @@ Without them, use the full path `~/.kiro/skills/session-history/scripts/ksi-quer
 ```bash
 kiro-resume                  # sessions started in this directory, newest first
 kiro-resume --all-dirs       # from everywhere
-kiro-resume -s "遗忘机制"     # only sessions that discussed it (implies --all-dirs)
+kiro-resume 遗忘机制          # only sessions that discussed it (implies --all-dirs)
+kiro-resume 记忆 遗忘         # both words present
+kiro-resume "遗忘 机制"       # that exact phrase
 kiro-resume -n 40            # a longer list
 ```
 
 Pick one and it resumes, changing directory to wherever that session was working.
 Selection uses `fzf` when you have it, a numbered menu otherwise.
 
-`-s` shows a hit count per session, and sorts sessions that matched a lot ahead of
-ones that barely did, so an old session about your topic is not buried under recent
-ones that mention it once. Sub-agent sessions are never listed or searched — every
-turn in them was written by the agent, not by you.
+Searching shows, under each session, the sentence the match was found in:
 
-Listing does not need the index and works even if you have never built one. `-s` does,
-and will build it if missing; if it cannot, it says so and exits non-zero rather than
-quietly searching worse.
+```
+7d ago      13x ai-workspace         handoff notes for the session index
+    …先核实几个我要引用的数字，避免记忆出错。
+1h ago       3x kiro-session-index   I have another utility ~/bin/kiro-resume
+    …then `记忆的遗忘机制是` becomes one token, and querying…
+```
+
+That second line is the point. A title is the opening prompt truncated, so it says
+how a session *started*, and what you searched for usually came up later — of the
+sessions matching `记忆`, none had the word in the title. Sorting is by hit count,
+then recency, so the session most about your topic is first rather than merely the
+most recent one that mentioned it. Typing in `fzf` narrows on both lines.
+
+Only your side of the conversation is searched. Not command output — a log that
+printed a word is not a discussion of it, and including it roughly doubles the list
+(`pipeline` matches 139 sessions in prose and another 134 in output alone); use
+`ksi-query -t` for that. Not sub-agent sessions either: every turn in them was
+written by the agent, not by you.
+
+Listing does not need the index and works even if you have never built one.
+Searching does, and will build it if missing; if it cannot, it says so and exits
+non-zero rather than quietly searching worse.
 
 ### Recover a past decision without leaving this session
 
@@ -110,7 +128,7 @@ quote back.
 | You want | How |
 |---|---|
 | A past discussion or decision | ask the agent, or `ksi-query` by hand |
-| To reopen that session and carry on | `kiro-resume -s` |
+| To reopen that session and carry on | `kiro-resume <words>` |
 | An error or command output you saw before | `ksi-query -t` |
 | A fragment inside an identifier, like `UserName` in `getUserName` | `ksi-query -l` |
 | The contents of a file that still exists | none of these — use ripgrep |
@@ -125,6 +143,16 @@ quote back.
 | `memory -pipeline` | first present, second absent |
 
 Chinese matches inside words: `忘机` finds `遗忘机制`.
+
+Two of these need care on a command line, because the shell gets there first.
+Quote a prefix search — bare `token*` is a glob, and in a directory that happens to
+contain a matching filename your shell will substitute it. And put an excluded term
+after `--`, since a leading dash otherwise looks like an option:
+
+```bash
+kiro-resume 'token*'
+kiro-resume -- memory -pipeline
+```
 
 ### Narrowing results
 
@@ -184,7 +212,7 @@ Nothing is ever sent anywhere.
 Try the other corpus (`ksi-query -t`), then `ksi-query -l`, then a different wording.
 The conversation may have used different words than your query.
 
-**`kiro-resume -s` says it cannot search the index.**
+**`kiro-resume` says it cannot search the index.**
 Plain `kiro-resume` still lists your sessions — listing never touches the index.
 Rebuild with `~/.kiro/skills/session-history/scripts/ksi-index --full`.
 

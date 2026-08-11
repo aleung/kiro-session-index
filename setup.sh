@@ -138,7 +138,7 @@ Done. The skill is live; this repo is no longer needed at runtime.
 
 On PATH now:
   kiro-resume              # pick a past session and resume it
-  kiro-resume -s 记忆      # ...find it by what was said in it first
+  kiro-resume 记忆         # ...find it by what was said in it first
   ksi-query "记忆 遗忘"    # search without leaving your current session
   ksi-query --status
 

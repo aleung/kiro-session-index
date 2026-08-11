@@ -109,12 +109,48 @@ the roll-up to parents made between 0 and 6 sessions unfindable out of 21 to 138
 matching, because a delegating session almost always states the task in its own
 prose first.
 
-`ksi/query.py:count_by_session` exists for the same reason the third point was
-measurable. The `search_*` functions take a *global* LIMIT ordered by rank, which
-answers "show me the best snippets" and not "which sessions mention this":
-on a 986-session corpus, `pipeline` under LIMIT 300 surfaced 105 of the 189 matching
-sessions, and `session` 44 of 119. Roughly half the matching sessions were invisible.
-Aggregating without a limit is the fix; exact hit counts are a by-product, not the goal.
+**Command output is excluded too**, one step further out from the same principle:
+a command that printed a word is not a discussion of it.
+Not a small effect — `pipeline` matches 139 sessions in prose and another 134 in
+output alone, `connection` 47 and 81 — so including it roughly doubles the list with
+sessions that merely logged the term, and a log that repeated it 400 times would sort
+straight to the top. `ksi-query -t` owns that corpus.
+
+**Searching shows the sentence the match was found in, not just the title.**
+Titles are the opening prompt truncated to ~50 characters, so they describe how a
+session started, while the thing you searched for usually came up later. Measured:
+of the sessions matching `记忆` 0 of 16 had the term in the title, `pipeline` 6 of 139,
+`vulnerability` 0 of 55. A list of titles is, with respect to the query, a list of
+near-random labels; the snippet is what makes the list judgeable.
+
+Details that took measuring rather than guessing:
+
+- Two lines per row, not one. On one line the title and the sentence share the ~54
+  columns left after the fixed fields and neither survives. Two-line items need
+  fzf 0.53+ and `--read0`, since NUL is what keeps a newline *inside* an item; under
+  the older one-line-per-item limit a preview window was the only alternative.
+- `T.snip` counts characters while the terminal counts columns, so a CJK snippet is
+  twice the width of an ASCII one at the same setting: at width 40 the median CJK
+  snippet is 108 columns against 48 for ASCII. Width 30 is where the matched term
+  survived the cut in every session measured; 40 lost it in 1 of 55 for
+  `vulnerability`, which reads as a word sliced in half at the margin.
+- The matched term is marked by *clearing* the dim rather than by adding bold. ANSI
+  keeps bold and faint in one intensity slot and SGR 22 resets both, so bold nested
+  inside faint is undefined and terminals disagree.
+- Searching orders by hit count, then recency; listing by recency alone. The two
+  modes have different intents, and an earlier attempt to serve both with a hit-count
+  band was degenerate anyway: prose-only counts have a median of 1 to 2, so for
+  narrow terms nobody reached the threshold and the band did nothing.
+- `-n` cuts before fzf sees the list, so anything past it cannot be reached by typing
+  either. Searching therefore gets a larger default (50 against 20).
+
+`ksi/query.py:sessions_matching` exists because `search_*` cannot answer this
+question. Those take a *global* LIMIT ordered by rank, which is right for "show me
+the best snippets" and wrong for "which sessions mention this": on a 986-session
+corpus `pipeline` under LIMIT 300 surfaced 105 of the 189 matching sessions, and
+`session` 44 of 119. Roughly half the matching sessions were invisible, silently.
+Aggregating without a limit is the fix; window functions give the count and the
+representative row in one pass.
 
 Known blind spot: the `exec` into `kiro-cli` is untested. It replaces the process, and
 a mock of it would assert only that the mock was called.
@@ -125,7 +161,9 @@ left it waiting for keystrokes with a blank screen — a hang, as far as the use
 tell. No pipe-based test can see that; with both streams captured fzf either exits or
 looks fine. The test therefore drives the entry point under a pty, and sets an explicit
 window size on it, since a full-screen picker given zero rows and columns also draws
-nothing and would make the test pass or fail for the wrong reason.
+nothing and would make the test pass or fail for the wrong reason. It asserts on fzf's
+item *total* as well as on the text, because a newline-separated payload renders the
+snippet too — as a second entry that resumes nothing.
 
 ## Session log data shapes
 

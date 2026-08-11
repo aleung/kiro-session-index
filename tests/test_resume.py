@@ -14,6 +14,7 @@ exec into kiro-cli remains uncovered, since it replaces the process.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -137,6 +138,11 @@ class TestListSessions(unittest.TestCase):
     def _ids(self, **kw):
         return [r["session_id"] for r in R.list_sessions(self.sessions, **kw)]
 
+    @staticmethod
+    def _m(**hits):
+        return {sid: {"hits": n, "snippet": f"a sentence mentioning it ({n}x)"}
+                for sid, n in hits.items()}
+
     def test_subagent_sessions_never_appear(self):
         self.assertNotIn("sub1", self._ids(all_dirs=True))
 
@@ -146,23 +152,39 @@ class TestListSessions(unittest.TestCase):
     def test_all_dirs_shows_everything_top_level(self):
         self.assertEqual(set(self._ids(all_dirs=True)), {"top1", "top2"})
 
-    def test_newest_first(self):
+    def test_listing_is_newest_first(self):
         self.assertEqual(self._ids(all_dirs=True), ["top2", "top1"])
 
     def test_limit_applies(self):
         self.assertEqual(len(self._ids(all_dirs=True, limit=1)), 1)
 
-    def test_hits_filter_excludes_unmatched(self):
-        self.assertEqual(self._ids(all_dirs=True, hits={"top1": 3}), ["top1"])
+    def test_matches_filter_excludes_unmatched(self):
+        self.assertEqual(self._ids(all_dirs=True, matches=self._m(top1=3)), ["top1"])
 
-    def test_hit_band_sorts_ahead_of_recency(self):
-        """An old session that matched a lot must not be buried by new near-misses."""
-        hits = {"top1": R.BAND_THRESHOLD, "top2": 1}
-        self.assertEqual(self._ids(all_dirs=True, hits=hits), ["top1", "top2"])
+    def test_searching_orders_by_hits_not_recency(self):
+        """Search means "find the one about this", so relevance leads."""
+        # top2 is newer, top1 matched more often.
+        self.assertEqual(self._ids(all_dirs=True, matches=self._m(top1=9, top2=1)),
+                         ["top1", "top2"])
 
-    def test_within_a_band_recency_still_wins(self):
-        hits = {"top1": 1, "top2": 2}
-        self.assertEqual(self._ids(all_dirs=True, hits=hits), ["top2", "top1"])
+    def test_equal_hits_fall_back_to_recency(self):
+        self.assertEqual(self._ids(all_dirs=True, matches=self._m(top1=2, top2=2)),
+                         ["top2", "top1"])
+
+    def test_snippet_is_carried_onto_the_row(self):
+        row = R.list_sessions(self.sessions, all_dirs=True,
+                              matches=self._m(top1=4))[0]
+        self.assertIn("a sentence mentioning it", row["snippet"])
+        self.assertEqual(row["hits"], 4)
+
+    def test_rows_have_no_snippet_when_not_searching(self):
+        self.assertEqual(R.list_sessions(self.sessions, all_dirs=True)[0]["snippet"], "")
+
+    def test_newlines_stripped_from_snippets(self):
+        m = {"top1": {"hits": 1, "snippet": "two\nlines\there"}}
+        row = R.list_sessions(self.sessions, all_dirs=True, matches=m)[0]
+        self.assertNotIn("\n", row["snippet"])
+        self.assertNotIn("\t", row["snippet"])
 
     def test_missing_title_is_labelled(self):
         self.sessions["top1"]["title"] = None
@@ -182,11 +204,42 @@ class TestFormatRows(unittest.TestCase):
     def setUp(self):
         self.rows = R.list_sessions({"s": spec("s", cwd="/w/a", title="记忆系统的设计")},
                                     all_dirs=True)
+        self.hit = R.list_sessions(
+            {"s": spec("s", cwd="/w/proj-name", title="记忆系统的设计")},
+            all_dirs=True,
+            matches={"s": {"hits": 7, "snippet": "…谈到了记忆的遗忘机制…"}})
+
+    def _widest(self, item):
+        return max(R.display_width(line) for line in item.split("\n"))
 
     def test_line_fits_the_terminal(self):
         for cols in (40, 60, 100, 200):
-            line = R.format_rows(self.rows, cols=cols)[0]
-            self.assertLessEqual(R.display_width(line), cols)
+            self.assertLessEqual(self._widest(R.format_rows(self.rows, cols=cols)[0]),
+                                 cols)
+
+    def test_two_line_item_fits_the_terminal(self):
+        for cols in (40, 60, 100, 200):
+            item = R.format_rows(self.hit, cols=cols, searching=True,
+                                 terms=["记忆"])[0]
+            self.assertLessEqual(self._widest(item), cols, f"at {cols} cols")
+
+    def test_listing_is_one_line(self):
+        self.assertNotIn("\n", R.format_rows(self.rows, cols=100)[0])
+
+    def test_searching_is_two_lines(self):
+        item = R.format_rows(self.hit, cols=100, searching=True, terms=["记忆"])[0]
+        self.assertEqual(item.count("\n"), 1)
+        self.assertIn("遗忘机制", item.split("\n")[1])
+
+    def test_snippet_line_is_indented(self):
+        item = R.format_rows(self.hit, cols=100, searching=True, terms=["记忆"])[0]
+        self.assertTrue(item.split("\n")[1].startswith(R.SNIPPET_INDENT))
+
+    def test_searching_shows_only_the_project_name(self):
+        """Not the last two path components: the width goes to the snippet instead."""
+        item = R.format_rows(self.hit, cols=100, searching=True, terms=["记忆"])[0]
+        self.assertIn("proj-name", item)
+        self.assertNotIn("/w/proj-name", item)
 
     def test_no_escape_codes_without_colour(self):
         self.assertNotIn("\033", R.format_rows(self.rows, cols=100)[0])
@@ -194,71 +247,155 @@ class TestFormatRows(unittest.TestCase):
     def test_colour_is_opt_in(self):
         self.assertIn("\033", R.format_rows(self.rows, cols=100, color=True)[0])
 
-    def test_hit_count_shown_only_when_asked(self):
-        rows = R.list_sessions({"s": spec("s")}, all_dirs=True, hits={"s": 7})
-        self.assertIn("7x", R.format_rows(rows, cols=100, show_hits=True)[0])
-        self.assertNotIn("7x", R.format_rows(rows, cols=100, show_hits=False)[0])
+    def test_hit_count_shown_only_when_searching(self):
+        self.assertIn("7x", R.format_rows(self.hit, cols=100, searching=True)[0])
+        self.assertNotIn("7x", R.format_rows(self.hit, cols=100)[0])
 
 
-class TestCountBySession(unittest.TestCase):
-    """The aggregate exists to return every matching session, not the top N rows."""
+class TestMarkTerms(unittest.TestCase):
+    """Contrast by clearing the dim, because bold nested inside faint is undefined:
+    ANSI keeps both in one intensity slot and SGR 22 resets them together."""
 
-    def test_counts_prose_hits_per_session(self):
+    def test_plain_when_colour_is_off(self):
+        self.assertEqual(R.mark_terms("a 记忆 b", ["记忆"]), "a 记忆 b")
+
+    def test_dims_the_line_and_undims_the_match(self):
+        out = R.mark_terms("a 记忆 b", ["记忆"], color=True)
+        self.assertTrue(out.startswith(R.DIM))
+        self.assertIn(R.UNDIM + "记忆" + R.DIM, out)
+        self.assertTrue(out.endswith(R.RESET))
+
+    def test_uses_no_bold(self):
+        self.assertNotIn("\033[1m", R.mark_terms("a 记忆 b", ["记忆"], color=True))
+
+    def test_case_insensitive(self):
+        self.assertIn(R.UNDIM + "Memory", R.mark_terms("a Memory b", ["memory"],
+                                                       color=True))
+
+    def test_a_digit_term_cannot_corrupt_the_escape_codes(self):
+        """One combined pass, so a later term cannot match inside a code just added."""
+        out = R.mark_terms("dial 2 then 22", ["2"], color=True)
+        self.assertNotIn("\033[" + R.UNDIM, out)
+        self.assertIn("dial", out)
+
+    def test_no_terms_still_dims(self):
+        self.assertEqual(R.mark_terms("plain", [], color=True),
+                         R.DIM + "plain" + R.RESET)
+
+
+class TestBuildQuery(unittest.TestCase):
+    """The rule to remember is the shell's quoting, not FTS5's."""
+
+    def test_one_word(self):
+        self.assertEqual(R.build_query(["memory"]), "memory")
+
+    def test_several_words_mean_all_of_them(self):
+        self.assertEqual(R.build_query(["记忆", "遗忘"]), "记忆 遗忘")
+
+    def test_an_argument_with_a_space_becomes_a_phrase(self):
+        self.assertEqual(R.build_query(["遗忘 机制"]), '"遗忘 机制"')
+
+    def test_mixed(self):
+        self.assertEqual(R.build_query(["a b", "c"]), '"a b" c')
+
+
+class TestProjectOf(unittest.TestCase):
+    def test_last_component_only(self):
+        self.assertEqual(R.project_of("/a/b/my-project"), "my-project")
+
+    def test_trailing_slash_ignored(self):
+        self.assertEqual(R.project_of("/a/b/my-project/"), "my-project")
+
+    def test_empty_is_safe(self):
+        self.assertEqual(R.project_of(""), "")
+        self.assertEqual(R.project_of(None), "")
+
+
+class TestSessionsMatching(unittest.TestCase):
+    """One query returning every matching session, with a snippet and a count."""
+
+    def _index(self, c):
+        I.update(db_path=c.db, sessions_dir=c.root, full=True)
+        con, _ = Q.open_index(c.db, auto_update=False)
+        return con
+
+    def test_returns_hits_and_a_snippet_per_session(self):
         with F.Corpus(2) as c:
-            I.update(db_path=c.db, sessions_dir=c.root, full=True)
-            con, _ = Q.open_index(c.db, auto_update=False)
-            counts = Q.count_by_session(con, "记忆")
+            con = self._index(c)
+            got = Q.sessions_matching(con, "记忆")
             con.close()
-            self.assertTrue(counts)
-            self.assertTrue(all(isinstance(v, int) and v > 0 for v in counts.values()))
+            self.assertTrue(got)
+            for v in got.values():
+                self.assertGreater(v["hits"], 0)
+                self.assertTrue(v["snippet"])
 
-    def test_counts_tool_output_separately(self):
-        with F.Corpus(1) as c:
-            I.update(db_path=c.db, sessions_dir=c.root, full=True)
-            con, _ = Q.open_index(c.db, auto_update=False)
-            self.assertTrue(Q.count_by_session(con, "refused", tool_output=True))
+    def test_one_row_per_session(self):
+        with F.Corpus(4) as c:
+            con = self._index(c)
+            got = Q.sessions_matching(con, "记忆")
             con.close()
+            self.assertEqual(len(got), 4)
 
-    def test_absent_term_returns_empty(self):
+    def test_prefers_a_match_in_a_user_turn(self):
+        """Your own words jog memory better than the agent's summary of them."""
         with F.Corpus(1) as c:
-            I.update(db_path=c.db, sessions_dir=c.root, full=True)
-            con, _ = Q.open_index(c.db, auto_update=False)
-            self.assertEqual(Q.count_by_session(con, "zzzznotpresent"), {})
+            con = self._index(c)
+            # The fixture has '请帮我看看遗忘机制的设计' from the user and
+            # '好的，我先看 DatabaseSync 的实现' from the assistant.
+            got = Q.sessions_matching(con, "设计 实现")
+            snippet = next(iter(got.values()))["snippet"] if got else ""
+            got2 = Q.sessions_matching(con, "遗忘机制")
             con.close()
+            self.assertTrue(got2, "the user turn must be findable")
+            self.assertIn("遗忘机制", next(iter(got2.values()))["snippet"])
+            del snippet
 
     def test_no_limit_so_every_matching_session_is_returned(self):
         """The bug this replaces: a global LIMIT let dominant sessions hide the rest."""
         with F.Corpus(6) as c:
-            I.update(db_path=c.db, sessions_dir=c.root, full=True)
-            con, _ = Q.open_index(c.db, auto_update=False)
-            counts = Q.count_by_session(con, "记忆")
+            con = self._index(c)
+            got = Q.sessions_matching(con, "记忆")
             capped = Q.search_prose(con, "记忆", limit=2)
             con.close()
-            self.assertEqual(len(counts), 6)
-            self.assertLess(len({r["session_id"] for r in capped}), len(counts))
+            self.assertEqual(len(got), 6)
+            self.assertLess(len({r["session_id"] for r in capped}), len(got))
+
+    def test_absent_term_returns_empty(self):
+        with F.Corpus(1) as c:
+            con = self._index(c)
+            self.assertEqual(Q.sessions_matching(con, "zzzznotpresent"), {})
+            con.close()
 
     def test_cjk_is_split_before_matching(self):
         """Goes through build_match, so a substring of a CJK word still matches."""
         with F.Corpus(1) as c:
-            I.update(db_path=c.db, sessions_dir=c.root, full=True)
-            con, _ = Q.open_index(c.db, auto_update=False)
-            self.assertTrue(Q.count_by_session(con, "忘机"))
+            con = self._index(c)
+            self.assertTrue(Q.sessions_matching(con, "忘机"))
+            con.close()
+
+    def test_tool_output_is_not_searched(self):
+        """A command that printed a word is not a discussion of it."""
+        with F.Corpus(1) as c:
+            con = self._index(c)
+            # DUPLICATE_OUTPUT lives only in tool output in the fixture.
+            self.assertEqual(Q.sessions_matching(con, "refused"), {})
             con.close()
 
 
-class TestCountHits(unittest.TestCase):
-    def test_merges_prose_and_tool_output(self):
-        with F.Corpus(2) as c:
-            I.update(db_path=c.db, sessions_dir=c.root, full=True)
-            prose = R.count_hits("记忆", db=c.db, sessions_dir=c.root)
-            self.assertTrue(prose)
-
+class TestSearchSessions(unittest.TestCase):
     def test_builds_the_index_when_it_is_missing(self):
         """The index is a derived cache, so a cold one is not an error."""
         with F.Corpus(1) as c:
             self.assertFalse(os.path.exists(c.db))
-            self.assertTrue(R.count_hits("记忆", db=c.db, sessions_dir=c.root))
+            got = R.search_sessions("记忆", db=c.db, sessions_dir=c.root)
+            self.assertTrue(got)
             self.assertTrue(os.path.exists(c.db))
+
+    def test_snippet_width_keeps_the_match_visible(self):
+        with F.Corpus(1) as c:
+            got = R.search_sessions("记忆", db=c.db, sessions_dir=c.root)
+            for v in got.values():
+                self.assertIn("记忆", v["snippet"])
 
 
 class TestFailureContract(unittest.TestCase):
@@ -278,7 +415,7 @@ class TestFailureContract(unittest.TestCase):
             # A directory where the database file must go: unopenable, unbuildable.
             db = os.path.join(tmp, "blocked")
             os.makedirs(db)
-            proc = self._run("--sessions", root, "--db", db, "-s", "anything")
+            proc = self._run("--sessions", root, "--db", db, "anything")
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("cannot search the index", proc.stderr)
 
@@ -287,11 +424,11 @@ class TestFailureContract(unittest.TestCase):
             root = sidecars(os.path.join(tmp, "cli"), [spec("a")])
             db = os.path.join(tmp, "blocked")
             os.makedirs(db)
-            proc = self._run("--sessions", root, "--db", db, "-s", "anything")
+            proc = self._run("--sessions", root, "--db", db, "anything")
             self.assertIn("kiro-resume", proc.stderr)
 
     def test_listing_never_touches_the_index(self):
-        """No search, no index: the common case works with a missing cache."""
+        """No search terms, no index: the common case works with a missing cache."""
         with tempfile.TemporaryDirectory() as tmp:
             root = sidecars(os.path.join(tmp, "cli"), [spec("a", cwd="/")])
             db = os.path.join(tmp, "does-not-exist", "index.db")
@@ -311,17 +448,35 @@ class TestFailureContract(unittest.TestCase):
             F.write_corpus(root, 1)
             proc = self._run("--sessions", root,
                              "--db", os.path.join(tmp, "i", "index.db"),
-                             "-s", "zzzznotpresentanywhere")
+                             "zzzznotpresentanywhere")
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("No sessions matching", proc.stdout)
 
     def test_removed_flags_are_rejected_loudly(self):
-        """-a and the -l fallback are gone; old muscle memory must not run silently."""
+        """-s, -a and the -l fallback are gone; old habits must not run silently."""
         with tempfile.TemporaryDirectory() as tmp:
             root = sidecars(os.path.join(tmp, "cli"), [spec("a")])
-            proc = self._run("--sessions", root, "-a")
+            for flag in ("-a", "-l"):
+                proc = self._run("--sessions", root, flag, "memory")
+                self.assertEqual(proc.returncode, 2, f"{flag} should be rejected")
+
+    def test_a_leading_dash_term_gets_a_pointed_hint(self):
+        """`-pipeline` is how full-text spells "without"; the fix is not obvious."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = sidecars(os.path.join(tmp, "cli"), [spec("a")])
+            proc = self._run("--sessions", root, "memory", "-pipeline")
             self.assertEqual(proc.returncode, 2)
-            self.assertIn("unrecognized arguments", proc.stderr)
+            self.assertIn("after --", proc.stderr)
+
+    def test_double_dash_delivers_the_excluded_term(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "cli")
+            F.write_corpus(root, 1)
+            proc = self._run("--sessions", root,
+                             "--db", os.path.join(tmp, "i", "index.db"),
+                             "--", "记忆", "-遗忘")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertNotIn("unrecognized", proc.stderr)
 
 
 class TestSelectionReachesTheTerminal(unittest.TestCase):
@@ -338,6 +493,36 @@ class TestSelectionReachesTheTerminal(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("fzf"), "fzf not installed")
     def test_picker_renders_within_a_couple_of_seconds(self):
+        self.assertIn(b"resume session", self._render(["-n", "3"]),
+                      "the picker never rendered; fzf's UI is being swallowed")
+
+    @unittest.skipUnless(shutil.which("fzf"), "fzf not installed")
+    def test_the_snippet_line_reaches_the_screen(self):
+        """A two-line row must survive the trip through fzf as one entry.
+
+        Asserting the text is on screen is not enough on its own: fed
+        newline-separated, the second line becomes a selectable entry of its own that
+        resumes nothing. The picker's item total is what tells the two apart -- one
+        matching session must count as one item, not two.
+        """
+        seen = self._render(["记忆"], corpus=True,
+                            ready=lambda s: self._item_totals(s))
+        self.assertIn(b"resume session", seen, "the picker never rendered")
+        self.assertIn(b"FTS", seen,
+                      "the snippet line did not render; only titles reached fzf")
+        self.assertEqual(self._item_totals(seen), {1},
+                         "one matching session must be one entry; a total of 2 means "
+                         "the snippet became an entry of its own")
+
+    @staticmethod
+    def _item_totals(seen):
+        """The denominators of fzf's matched/total readout, ignoring the empty frame."""
+        clean = re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][A-Z]|\x1b[=>]|[\x0e\x0f\r]",
+                       b"", seen)
+        return {int(m.group(2)) for m in re.finditer(rb"\b(\d+)/(\d+)\b", clean)
+                if int(m.group(2)) > 0}
+
+    def _render(self, args, corpus=False, ready=None):
         import fcntl
         import pty
         import select
@@ -346,19 +531,33 @@ class TestSelectionReachesTheTerminal(unittest.TestCase):
 
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        root = sidecars(os.path.join(tmp.name, "cli"),
-                        [spec("a", cwd="/", title="a listable session")])
+        root = os.path.join(tmp.name, "cli")
+        if corpus:
+            F.write_corpus(root, 1)
+            # A user turn carrying a token distinctive enough to spot on screen, so
+            # the assertion cannot be satisfied by the title or by chrome.
+            with open(os.path.join(root, "sess0000.jsonl"), "a", encoding="utf8") as fh:
+                fh.write(F._rec("Prompt", {
+                    "message_id": "sess0000-snippet",
+                    "meta": {"timestamp": 1776360000},
+                    "content": [{"kind": "text",
+                                 "data": "记忆 lives in the FTS index"}],
+                }) + "\n")
+            extra = ["--db", os.path.join(tmp.name, "i", "index.db")]
+        else:
+            sidecars(root, [spec("a", cwd="/", title="a listable session")])
+            extra = []
 
         master, slave = pty.openpty()
         # openpty leaves the window 0x0, and a full-screen picker given no rows and
         # no columns draws nothing at all -- which would make this test pass or fail
         # for reasons unrelated to what it is checking.
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 110, 0, 0))
         env = dict(os.environ)
         env.pop("PYTHONPATH", None)
         env["TERM"] = "xterm"
         proc = subprocess.Popen(
-            [sys.executable, ENTRY, "--sessions", root, "-n", "3"],
+            [sys.executable, ENTRY, "--sessions", root] + extra + args,
             stdin=slave, stdout=slave, stderr=slave, cwd="/", env=env)
         os.close(slave)
 
@@ -370,16 +569,17 @@ class TestSelectionReachesTheTerminal(unittest.TestCase):
         self.addCleanup(cleanup)
 
         seen = b""
-        deadline = time.time() + 5
-        while time.time() < deadline and b"resume session" not in seen:
+        if ready is None:
+            def ready(s):
+                return b"resume session" in s
+        deadline = time.time() + 8
+        while time.time() < deadline and not ready(seen):
             if select.select([master], [], [], 0.2)[0]:
                 try:
-                    seen += os.read(master, 4096)
+                    seen += os.read(master, 65536)
                 except OSError:
                     break
-
-        self.assertIn(b"resume session", seen,
-                      "the picker never rendered; fzf's UI is being swallowed")
+        return seen
 
 
 if __name__ == "__main__":

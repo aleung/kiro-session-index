@@ -217,33 +217,43 @@ def search_like(con, needle, limit=10, width=40, tool_output=False, prefilter=No
     return out
 
 
-def count_by_session(con, query, tool_output=False):
-    """Hits per session for a full-text query, with no LIMIT: {session_id: n}.
+def sessions_matching(con, query, snip_width=30):
+    """Every session whose prose matches, with a count and one snippet each:
+    {session_id: {"hits": int, "snippet": str}}.
 
-    The search_* functions take a global LIMIT and order by rank, which is right
-    when the answer is a list of snippets and wrong when the question is "which
-    sessions mention this at all" -- a few dominant sessions eat the whole budget.
-    Measured on a 986-session corpus: `pipeline` under LIMIT 300 surfaced 105 of
-    the 189 sessions that actually match, `session` 44 of 119. A caller that needs
-    the complete set has to aggregate rather than truncate.
+    Three things this does that search_prose deliberately does not.
 
-    Counting also skips snippet extraction, so for that purpose this is cheaper
-    than the search it replaces rather than an extra cost.
+    No LIMIT. search_prose takes a *global* limit ordered by rank, which answers
+    "show me the best snippets" and not "which sessions mention this" -- a few
+    dominant sessions eat the whole budget. Measured on a 986-session corpus:
+    `pipeline` under LIMIT 300 surfaced 105 of the 189 sessions that actually
+    match, `session` 44 of 119. Roughly half were invisible, silently.
+
+    One row per session, chosen by ROW_NUMBER, preferring a match in a *user*
+    turn. The point of the snippet is to jog your memory, and your own words do
+    that better than the agent's summary of them.
+
+    The count comes free from the same scan via COUNT(*) OVER, so asking for both
+    costs one query rather than two.
     """
     match = T.build_match(query)
-    if tool_output:
-        sql = ("SELECT r.session_id AS session_id, COUNT(*) AS n "
-               "FROM tool_output_fts f "
-               "JOIN tool_results r ON r.output_id = f.rowid "
-               "WHERE tool_output_fts MATCH ? "
-               "GROUP BY r.session_id")
-    else:
-        sql = ("SELECT m.session_id AS session_id, COUNT(*) AS n "
-               "FROM messages_fts f "
-               "JOIN messages m ON m.id = f.rowid "
-               "WHERE messages_fts MATCH ? "
-               "GROUP BY m.session_id")
-    return {r["session_id"]: r["n"] for r in con.execute(sql, [match])}
+    terms = T.query_terms(query)
+    sql = """
+    WITH m AS (
+      SELECT msg.session_id AS session_id,
+             msg.text        AS body,
+             ROW_NUMBER() OVER (PARTITION BY msg.session_id
+                                ORDER BY (msg.role = 'user') DESC, f.rank) AS rn,
+             COUNT(*)     OVER (PARTITION BY msg.session_id)                AS hits
+      FROM messages_fts f
+      JOIN messages msg ON msg.id = f.rowid
+      WHERE messages_fts MATCH ?
+    )
+    SELECT session_id, hits, body FROM m WHERE rn = 1
+    """
+    return {r["session_id"]: {"hits": r["hits"],
+                              "snippet": T.snip(r["body"], terms, snip_width)}
+            for r in con.execute(sql, [match])}
 
 
 def run_sql(con, sql, limit=200):
