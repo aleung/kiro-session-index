@@ -81,8 +81,17 @@ RESET = "\033[0m"
 def load_sessions(sessions_dir=None):
     """Every session's metadata, read from the .json sidecars: {session_id: meta}.
 
-    Unreadable sidecars are skipped rather than fatal: one corrupt file must not
-    make the whole list unavailable.
+    Sessions with nothing in them are left out. A session file gets created when a
+    session is opened, so an abandoned launch leaves a sidecar with no title beside a
+    zero-byte log -- and resuming one lands you in a blank session, which is what
+    starting a new one does anyway. They are not rare enough to ignore: 17 of 688
+    top-level sessions, 5 of them inside the most recent 20 in one project. Measured
+    over the whole corpus the two sets coincide exactly -- every untitled session had
+    an empty log, and every empty log was untitled -- so this removes the noise and
+    nothing else.
+
+    Unreadable sidecars are skipped rather than fatal: one corrupt file must not make
+    the whole list unavailable.
     """
     sessions_dir = sessions_dir or I._sessions_dir()
     out = {}
@@ -94,9 +103,24 @@ def load_sessions(sessions_dir=None):
             continue
         if not isinstance(meta, dict):
             continue
+        if not has_content(path[: -len(".json")] + ".jsonl"):
+            continue
         sid = meta.get("session_id") or os.path.splitext(os.path.basename(path))[0]
         out[sid] = meta
     return out
+
+
+def has_content(log_path):
+    """Did anything ever get said in this session?
+
+    One stat, not a parse: the log is append-only, so a non-zero size means at least
+    one record was written. Treating a missing log the same as an empty one is
+    deliberate -- either way there is no conversation to go back to.
+    """
+    try:
+        return os.path.getsize(log_path) > 0
+    except OSError:
+        return False
 
 
 def is_subagent(meta):

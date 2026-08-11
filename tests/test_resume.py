@@ -33,16 +33,26 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENTRY = os.path.join(REPO, "tools", "kiro-resume")
 
 
-def sidecars(root, specs):
-    """Write .json sidecars only -- no .jsonl -- and return the directory.
+def sidecars(root, specs, with_log=True):
+    """Write .json sidecars, each beside a log with something in it.
 
-    Sidecar-only is the interesting shape: it is exactly what the index cannot
-    see, since a sessions row is created while parsing the .jsonl.
+    Sidecar-only is the interesting shape for the *index*: it is exactly what the
+    index cannot see, since a sessions row is created while parsing the .jsonl. But
+    the listing skips sessions whose log is empty, so a fixture needs a non-empty log
+    to be listed at all -- pass with_log=False to build the abandoned-launch case.
     """
     os.makedirs(root, exist_ok=True)
     for spec in specs:
-        with open(os.path.join(root, spec["session_id"] + ".json"), "w") as fh:
+        sid = spec["session_id"]
+        with open(os.path.join(root, sid + ".json"), "w") as fh:
             json.dump(spec, fh)
+        if with_log:
+            with open(os.path.join(root, sid + ".jsonl"), "w") as fh:
+                fh.write(json.dumps({"version": "1", "kind": "Prompt", "data": {
+                    "message_id": sid + "-m1", "meta": {"timestamp": 1776350561},
+                    "content": [{"kind": "text", "data": "a turn"}]}}) + "\n")
+        else:
+            open(os.path.join(root, sid + ".jsonl"), "w").close()
     return root
 
 
@@ -112,7 +122,7 @@ class TestAge(unittest.TestCase):
 
 
 class TestLoadSessions(unittest.TestCase):
-    def test_reads_sidecars_without_any_jsonl(self):
+    def test_reads_sidecars_without_the_index(self):
         """The list must not depend on the index, or a cold cache hides sessions."""
         with tempfile.TemporaryDirectory() as tmp:
             root = sidecars(tmp, [spec("a"), spec("b")])
@@ -124,6 +134,42 @@ class TestLoadSessions(unittest.TestCase):
             with open(os.path.join(root, "bad.json"), "w") as fh:
                 fh.write("{ this is not json")
             self.assertEqual(set(R.load_sessions(root)), {"good"})
+
+    def test_abandoned_launch_is_not_listed(self):
+        """Opening a session writes the files; saying nothing leaves an empty log.
+
+        These were showing up as "(untitled)" rows -- 17 of 688 sessions, 5 of them in
+        one project's most recent 20 -- and resuming one lands in a blank session.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecars(tmp, [spec("used")])
+            sidecars(tmp, [spec("abandoned", title=None)], with_log=False)
+            self.assertEqual(set(R.load_sessions(tmp)), {"used"})
+
+    def test_a_sidecar_with_no_log_at_all_is_not_listed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecars(tmp, [spec("used")])
+            with open(os.path.join(tmp, "orphan.json"), "w") as fh:
+                json.dump(spec("orphan"), fh)
+            self.assertEqual(set(R.load_sessions(tmp)), {"used"})
+
+
+class TestHasContent(unittest.TestCase):
+    def test_empty_log_has_nothing_to_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "s.jsonl")
+            open(p, "w").close()
+            self.assertFalse(R.has_content(p))
+
+    def test_a_log_with_a_record_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "s.jsonl")
+            with open(p, "w") as fh:
+                fh.write("{}\n")
+            self.assertTrue(R.has_content(p))
+
+    def test_missing_log_is_treated_as_empty(self):
+        self.assertFalse(R.has_content("/nonexistent/s.jsonl"))
 
 
 class TestListSessions(unittest.TestCase):
