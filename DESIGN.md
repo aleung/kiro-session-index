@@ -129,11 +129,26 @@ Details that took measuring rather than guessing:
   columns left after the fixed fields and neither survives. Two-line items need
   fzf 0.53+ and `--read0`, since NUL is what keeps a newline *inside* an item; under
   the older one-line-per-item limit a preview window was the only alternative.
-- `T.snip` counts characters while the terminal counts columns, so a CJK snippet is
-  twice the width of an ASCII one at the same setting: at width 40 the median CJK
-  snippet is 108 columns against 48 for ASCII. Width 30 is where the matched term
-  survived the cut in every session measured; 40 lost it in 1 of 55 for
-  `vulnerability`, which reads as a word sliced in half at the margin.
+- The snippet is cut twice, and only the second cut knows about the screen. `T.snip`
+  slices a generous fixed window at query time — its only job is to bound how much
+  text a row carries, and it is nearly free, since the body it slices is already in
+  memory for the row being returned. `window` then cuts to the terminal at display
+  time, in columns. Keeping the screen out of the query layer is what the split buys:
+  `T.snip` counts characters while the terminal counts columns, and a CJK character
+  costs two of them, so *any* single character width is either too narrow for ASCII —
+  a fixed 30 produced a 78-column snippet whether the terminal was 100 columns or 300 —
+  or too wide for CJK. In columns the question does not arise.
+- `window` cuts *around* the match, not from an end, and that is the reason it is not
+  simply `truncate`. On a snippet carrying generous context the term sits in the
+  middle, so a right-truncate removes it first: measured, `truncate` on a 613-character
+  snippet returned 92 columns of leading filler with the match nowhere in it. Whichever
+  side runs out of text donates its share to the other, so a match near the start or
+  end of a sentence still fills the line.
+- A hand-picked query-time width of 30 held up for a long time because it happened to
+  be right for one terminal size: the constraint it was satisfying was
+  `2 * width + len(term) <= room`, which at the 80–100 columns this was developed on
+  admits 33 to 39. Hence 30 surviving in every session measured, and 40 slicing
+  `vulnerability` at the margin in 1 of 55.
 - The matched term is marked by *clearing* the dim rather than by adding bold. ANSI
   keeps bold and faint in one intensity slot and SGR 22 resets both, so bold nested
   inside faint is undefined and terminals disagree.

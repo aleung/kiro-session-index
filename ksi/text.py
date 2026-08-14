@@ -110,6 +110,31 @@ def query_terms(query: str) -> list:
     return out
 
 
+def first_match(text: str, terms) -> tuple:
+    """Where the earliest of `terms` occurs in `text`: (pos, matched_text).
+
+    (-1, "") when none of them do. Case-insensitive, and the term is returned as the
+    caller spelled it, not as the text spells it -- only its length is used.
+
+    Shared by snip and by resume's display-time window because both have to cut
+    *around* the match rather than from an end, and they differ only in the unit they
+    measure the cut in: characters here, display columns there.
+    """
+    if not text:
+        return -1, ""
+    if isinstance(terms, str):
+        terms = [terms]
+    low = text.lower()
+    pos, hit = -1, ""
+    for t in terms or []:
+        if not t:
+            continue
+        i = low.find(t.lower())
+        if i >= 0 and (pos < 0 or i < pos):
+            pos, hit = i, t
+    return pos, hit
+
+
 def snip(text: str, terms, width: int = 40) -> str:
     """Build a readable snippet from ORIGINAL text.
 
@@ -121,17 +146,8 @@ def snip(text: str, terms, width: int = 40) -> str:
     """
     if not text:
         return ""
-    if isinstance(terms, str):
-        terms = [terms]
     flat = text.replace("\n", " ").replace("\r", " ")
-    low = flat.lower()
-    pos, hit = -1, ""
-    for t in terms or []:
-        if not t:
-            continue
-        i = low.find(t.lower())
-        if i >= 0 and (pos < 0 or i < pos):
-            pos, hit = i, t
+    pos, hit = first_match(flat, terms)
     if pos < 0:
         head = flat[: width * 2].strip()
         return head + ("…" if len(flat) > width * 2 else "")

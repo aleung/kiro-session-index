@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ksi import index as I
 from ksi import query as Q
 from ksi import resume as R
+from ksi import text as T
 from tests import fixtures as F
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -296,6 +297,86 @@ class TestFormatRows(unittest.TestCase):
     def test_hit_count_shown_only_when_searching(self):
         self.assertIn("7x", R.format_rows(self.hit, cols=100, searching=True)[0])
         self.assertNotIn("7x", R.format_rows(self.hit, cols=100)[0])
+
+
+class TestSnippetWindow(unittest.TestCase):
+    """The query layer returns more text than the screen holds; `window` cuts it.
+
+    Which puts the two things in tension on one function: the line must be filled at
+    any width, and the matched term must still be in it. These assert both ends at
+    every size, for ASCII and for CJK -- a CJK character costs two columns, so the
+    same characters of context reach twice as far towards the right margin.
+    """
+
+    # The term sits in the middle of each, because window centres on the FIRST
+    # occurrence: with the match at the start there is no left context to fill the
+    # line with, and the test would measure the fixture rather than the code.
+    TERM = "vulnerability"
+    ASCII = ("the build failed again " * 40) + TERM + (" and then some more" * 40)
+    CJK = ("记忆的遗忘机制是" * 40) + TERM + ("讨论过的内容" * 40)
+
+    def _snippet_line(self, text, cols):
+        """What format_rows would print, as its width in columns and its content."""
+        terms = [self.TERM]
+        snippet = T.snip(text, terms, R.SNIP_CONTEXT)     # what the query returns
+        return R.SNIPPET_INDENT + R.window(snippet, terms, R.snippet_room(cols))
+
+    def test_ascii_snippet_fills_the_line(self):
+        """The bug this guards: at 200 columns a query-time width of 30 produced a
+        ~70-column snippet with 120 columns of blank to its right."""
+        for cols in (80, 100, 160, 200, 300):
+            line = self._snippet_line(self.ASCII, cols)
+            self.assertGreaterEqual(R.display_width(line), R.snippet_room(cols) - 2,
+                                    f"at {cols} cols")
+
+    def test_cjk_snippet_fills_the_line(self):
+        for cols in (80, 100, 160, 200, 300):
+            line = self._snippet_line(self.CJK, cols)
+            self.assertGreaterEqual(R.display_width(line), R.snippet_room(cols) - 2,
+                                    f"at {cols} cols")
+
+    def test_the_match_survives_the_cut(self):
+        """What a right-truncate cannot do: on a snippet carrying generous context the
+        term is in the middle, so cutting from the right removes it first."""
+        for text in (self.ASCII, self.CJK):
+            for cols in (40, 80, 100, 160, 200, 300):
+                self.assertIn(self.TERM, self._snippet_line(text, cols),
+                              f"at {cols} cols")
+
+    def test_line_still_fits_the_terminal(self):
+        for text in (self.ASCII, self.CJK):
+            for cols in (40, 80, 100, 160, 200, 300):
+                self.assertLessEqual(R.display_width(self._snippet_line(text, cols)),
+                                     cols, f"at {cols} cols")
+
+    def test_a_short_snippet_is_left_alone(self):
+        self.assertEqual(R.window("a 记忆 b", ["记忆"], 92), "a 记忆 b")
+
+    def test_context_on_both_sides_of_the_match(self):
+        got = R.window(self.ASCII, [self.TERM], 92)
+        before, _, after = got.partition(self.TERM)
+        self.assertTrue(before.strip("… "), "no left context")
+        self.assertTrue(after.strip("… "), "no right context")
+
+    def test_a_match_near_the_start_still_fills_the_line(self):
+        """The side that runs out of text donates its share to the other."""
+        text = "vulnerability" + (" and then some more" * 40)
+        got = R.window(text, [self.TERM], 92)
+        self.assertIn(self.TERM, got)
+        self.assertGreaterEqual(R.display_width(got), 90)
+
+    def test_a_match_near_the_end_still_fills_the_line(self):
+        text = ("the build failed again " * 40) + "vulnerability"
+        got = R.window(text, [self.TERM], 92)
+        self.assertIn(self.TERM, got)
+        self.assertGreaterEqual(R.display_width(got), 90)
+
+    def test_falls_back_to_truncation_without_a_match(self):
+        """A snippet with no term in it is shown for its opening words."""
+        text = "the build failed again " * 40
+        got = R.window(text, ["nothing here"], 92)
+        self.assertTrue(text.startswith(got.rstrip("…")))
+        self.assertLessEqual(R.display_width(got), 92)
 
 
 class TestMarkTerms(unittest.TestCase):

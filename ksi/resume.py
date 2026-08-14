@@ -53,13 +53,23 @@ from . import index as I
 from . import query as Q
 from . import text as T
 
-# How much context T.snip keeps either side of the match, in characters. 30 is where
-# "as much context as possible" meets "the matched word always survives the cut":
-# snip counts characters while the terminal counts columns, so a CJK snippet occupies
-# twice the width of an ASCII one at the same setting. Measured against the corpus, 20
-# and 30 kept the matched term visible in every matching session; 40 lost it in 1 of
-# 55 for `vulnerability`, which shows up as a word sliced in half at the right margin.
-SNIP_WIDTH = 30
+# Context T.snip keeps either side of the match at query time, in characters. This is
+# not a display width and is deliberately larger than any terminal we would cut to:
+# it exists only to bound how much text a row carries, since the body it slices is
+# already fully in memory. The cut that has to fit the screen happens at display time,
+# in `window`, where the unit is columns -- the unit the terminal actually uses.
+#
+# An earlier version derived this from the terminal instead, which worked but put the
+# screen's width into the query layer: snip counts characters and a CJK character costs
+# two columns, so any single character width either leaves an ASCII snippet filling half
+# a wide terminal or lets a CJK one overrun. That is a display problem and it is fixed
+# where display happens.
+SNIP_CONTEXT = 400
+
+# Columns a snippet line gets even on an absurdly narrow terminal, and the width of
+# the line number the numbered-menu path prefixes ('NN  ').
+MIN_SNIPPET_ROOM = 20
+LINENO_WIDTH = 4
 
 # Rows shown before the picker opens. Searching gets a bigger budget because the cut
 # happens *before* fzf sees the list, so anything past it cannot be reached by typing
@@ -170,6 +180,62 @@ def truncate(s, max_w):
     return "".join(out) + "…"
 
 
+def snippet_room(cols):
+    """Display columns the snippet line has to fill, on a terminal `cols` wide.
+
+    Its own indent, and the line number the numbered-menu path prefixes to the first
+    line of an item -- charged to both lines so the two stay aligned.
+    """
+    return max(cols - display_width(SNIPPET_INDENT) - LINENO_WIDTH, MIN_SNIPPET_ROOM)
+
+
+def _fits(chars, budget):
+    """How many leading characters of `chars` fit in `budget` columns: (count, width)."""
+    n = w = 0
+    for c in chars:
+        cw = 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+        if w + cw > budget:
+            break
+        w += cw
+        n += 1
+    return n, w
+
+
+def window(s, terms, room):
+    """Cut `s` to `room` display columns, keeping the matched term inside the result.
+
+    `truncate` cannot do this job, and that is the whole reason this exists: it cuts
+    from the right, so on a snippet carrying generous context the term -- which sits in
+    the middle -- is the first thing to go. Cutting a window *around* the match is what
+    makes it safe for the query layer to return more text than the screen can hold, and
+    that is what lets the line be filled at any width.
+
+    The term keeps its context on both sides, and whichever side runs out of text
+    donates its share to the other, so a match near the beginning or the end of a
+    sentence still fills the line rather than leaving it half empty.
+    """
+    if display_width(s) <= room:
+        return s
+    pos, hit = T.first_match(s, terms)
+    if pos < 0:
+        # Nothing to centre on: the snippet is being shown for its opening words.
+        return truncate(s, room)
+    end_of_hit = pos + len(hit)
+    budget = room - 2 - display_width(s[pos:end_of_hit])   # 2 for the ellipses
+    if budget < 0:
+        # The term alone is wider than the line. Show its start; nothing else fits.
+        return truncate(s[pos:], room)
+    # Three passes, not two, so the donation works in both directions: the right side
+    # is offered half, the left takes what the right left over, and the right is then
+    # re-offered whatever the left could not use.
+    _, right_w = _fits(s[end_of_hit:], budget // 2)
+    left_n, left_w = _fits(reversed(s[:pos]), budget - right_w)
+    right_n, _ = _fits(s[end_of_hit:], budget - left_w)
+    start, stop = pos - left_n, end_of_hit + right_n
+    return (("…" if start > 0 else "") + s[start:stop].strip()
+            + ("…" if stop < len(s) else ""))
+
+
 def project_of(cwd):
     """Just the last path component -- the project, not the route to it.
 
@@ -194,12 +260,15 @@ def build_query(terms):
 def search_sessions(query, db=None, sessions_dir=None):
     """{session_id: {"hits": int, "snippet": str}} for everything that matches.
 
+    Snippets come back wider than any screen; `window` cuts them to fit at display
+    time. Nothing here needs to know how wide the terminal is.
+
     Refreshes the index first, and lets any failure propagate: the caller turns it
     into a loud error rather than a degraded search.
     """
     con, _refreshed = Q.open_index(db, auto_update=True, sessions_dir=sessions_dir)
     try:
-        return Q.sessions_matching(con, query, snip_width=SNIP_WIDTH)
+        return Q.sessions_matching(con, query, snip_width=SNIP_CONTEXT)
     finally:
         con.close()
 
@@ -287,7 +356,8 @@ def format_rows(rows, cols=100, show_cwd=False, searching=False, terms=(),
     else:
         dim = cyan = yellow = reset = ""
 
-    avail = cols - 4          # the caller prefixes a line number: 'NN  '
+    avail = cols - LINENO_WIDTH   # the caller prefixes a line number: 'NN  '
+    room = snippet_room(cols)
     out = []
     for r in rows:
         used = 10
@@ -307,8 +377,7 @@ def format_rows(rows, cols=100, show_cwd=False, searching=False, terms=(),
         item = (age_part + hits_part + cwd_part
                 + truncate(r["title"], max(avail - used, 10)))
         if searching and r.get("snippet"):
-            room = max(cols - display_width(SNIPPET_INDENT) - 4, 20)
-            item += "\n" + SNIPPET_INDENT + mark_terms(truncate(r["snippet"], room),
+            item += "\n" + SNIPPET_INDENT + mark_terms(window(r["snippet"], terms, room),
                                                        terms, color)
         out.append(item)
     return out
@@ -448,6 +517,7 @@ def main(argv=None):
 
     searching = bool(args.terms)
     query = build_query(args.terms) if searching else ""
+    terms = T.query_terms(query) if searching else ()
     limit = args.limit if args.limit is not None else (
         DEFAULT_LIMIT_SEARCH if searching else DEFAULT_LIMIT_LIST)
 
@@ -483,7 +553,7 @@ def main(argv=None):
         cols=shutil.get_terminal_size((100, 24)).columns,
         show_cwd=args.all_dirs,
         searching=searching,
-        terms=T.query_terms(query) if searching else (),
+        terms=terms,
         # stderr, not stdout: stdout may be a pipe while the user still has a tty.
         color=sys.stderr.isatty())
 
