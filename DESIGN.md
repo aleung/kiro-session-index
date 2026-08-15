@@ -129,6 +129,19 @@ Details that took measuring rather than guessing:
   columns left after the fixed fields and neither survives. Two-line items need
   fzf 0.53+ and `--read0`, since NUL is what keeps a newline *inside* an item; under
   the older one-line-per-item limit a preview window was the only alternative.
+- The metadata is a gutter down the left of both lines — when and how many above which
+  project — and not a run of fields inline on the first. Inline it cost 37 columns and,
+  because a project name's width varies, put the title in a different column on every
+  row; split over two lines the gutter only has to fit the widest single field, so 21
+  columns do it. What that buys is one content column with a stable left edge: the title
+  and the sentence that says why the session matched begin at the same place on every
+  row, which is the difference between reading a list down and hunting through it.
+  `gutter_width` yields on a narrow terminal rather than squeezing the sentence.
+- A blank row between items, which reverses part of the decision below it. Density was
+  the wrong thing to spend that row on: the indent and the dim do say which line belongs
+  to which session when you read one item, but twenty items with no separation are one
+  block of text, and scanning needs edges. `--gap-line=` is what keeps it blank —
+  `--gap=1` alone draws a dashed rule in fzf 0.67.
 - The snippet is cut twice, and only the second cut knows about the screen. `T.snip`
   slices a generous fixed window at query time — its only job is to bound how much
   text a row carries, and it is nearly free, since the body it slices is already in
@@ -149,9 +162,27 @@ Details that took measuring rather than guessing:
   `2 * width + len(term) <= room`, which at the 80–100 columns this was developed on
   admits 33 to 39. Hence 30 surviving in every session measured, and 40 slicing
   `vulnerability` at the margin in 1 of 55.
-- The matched term is marked by *clearing* the dim rather than by adding bold. ANSI
-  keeps bold and faint in one intensity slot and SGR 22 resets both, so bold nested
-  inside faint is undefined and terminals disagree.
+- Intensity marks one thing — the metadata gutter is dim, the content is not — and hue
+  marks the rest: magenta the hit count, cyan the project, yellow the matched term, each
+  appearing nowhere else. Getting here meant ruling out both ends by looking at them.
+  Brightness cannot rank rows inside an item, because a list applies it to every row:
+  twenty bright titles are a wall rather than a landmark, and a bright title over a dim
+  snippet puts the screen's largest contrast inside one item, on the line that is only
+  the opening prompt truncated rather than the one that answers the question. Dimming all
+  of it instead reads as uniformly too faint. Separation between items is what made the
+  list scannable, and that is structural, which leaves brightness with one job.
+- Only the dim attribute, never an explicit grey. A 256-colour ramp would let the
+  snippet sit one step above the title, which dim cannot express, but it assumes a dark
+  background and this is published code. `test_no_explicit_grey_is_used` holds the line.
+- Spans close with SGR 39, not SGR 0: 39 resets the foreground and leaves intensity
+  alone, so the gutter can colour one field without ending the dim that covers the rest.
+- fzf's bold on the current item is turned off (`--color=fg+:regular`), leaving the
+  background band to mark it, which is enough on its own. Bold was a third intensity on
+  top of the two the list already used, landing on text whose weight carries meaning. On
+  the wire the current item goes from `1;38;5;254;48;5;236` to `38;5;254;48;5;236`; its
+  second line went from `1;2;…` — bold nested inside faint, which ANSI leaves undefined
+  and terminals disagree about — to a plain `2`. `--highlight-line` is not this: it
+  widens the band and keeps the bold.
 - Searching orders by hit count, then recency; listing by recency alone. The two
   modes have different intents, and an earlier attempt to serve both with a hit-count
   band was degenerate anyway: prose-only counts have a median of 1 to 2, so for

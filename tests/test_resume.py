@@ -278,9 +278,27 @@ class TestFormatRows(unittest.TestCase):
         self.assertEqual(item.count("\n"), 1)
         self.assertIn("遗忘机制", item.split("\n")[1])
 
-    def test_snippet_line_is_indented(self):
+    def test_the_two_lines_share_one_content_column(self):
+        """The point of the gutter: the title and the sentence below it start at the
+        same column, so the list has a single left edge to read down.
+
+        Inline metadata could not do this -- a project name's width varies, so the
+        title landed in a different column on every row.
+        """
         item = R.format_rows(self.hit, cols=100, searching=True, terms=["记忆"])[0]
-        self.assertTrue(item.split("\n")[1].startswith(R.SNIPPET_INDENT))
+        top, bottom = item.split("\n")
+        gut = R.gutter_width(100)
+        self.assertEqual(R.display_width(top[:gut]), gut)
+        self.assertEqual(R.display_width(bottom[:gut]), gut)
+        self.assertTrue(top[gut:].startswith("记忆系统的设计"), top[gut:][:20])
+        self.assertTrue(bottom[gut:].startswith("…谈到了"), bottom[gut:][:20])
+
+    def test_the_gutter_carries_when_above_where(self):
+        item = R.format_rows(self.hit, cols=100, searching=True, terms=["记忆"])[0]
+        top, bottom = item.split("\n")
+        gut = R.gutter_width(100)
+        self.assertIn("7x", top[:gut])
+        self.assertIn("proj-name", bottom[:gut])
 
     def test_searching_shows_only_the_project_name(self):
         """Not the last two path components: the width goes to the snippet instead."""
@@ -316,10 +334,11 @@ class TestSnippetWindow(unittest.TestCase):
     CJK = ("记忆的遗忘机制是" * 40) + TERM + ("讨论过的内容" * 40)
 
     def _snippet_line(self, text, cols):
-        """What format_rows would print, as its width in columns and its content."""
+        """What format_rows would print for the content line: gutter, then the cut."""
         terms = [self.TERM]
         snippet = T.snip(text, terms, R.SNIP_CONTEXT)     # what the query returns
-        return R.SNIPPET_INDENT + R.window(snippet, terms, R.snippet_room(cols))
+        return " " * R.gutter_width(cols) + R.window(snippet, terms,
+                                                     R.snippet_room(cols))
 
     def test_ascii_snippet_fills_the_line(self):
         """The bug this guards: at 200 columns a query-time width of 30 produced a
@@ -380,34 +399,96 @@ class TestSnippetWindow(unittest.TestCase):
 
 
 class TestMarkTerms(unittest.TestCase):
-    """Contrast by clearing the dim, because bold nested inside faint is undefined:
-    ANSI keeps both in one intensity slot and SGR 22 resets them together."""
+    """Colour the match; touch nothing else.
+
+    Each of the alternatives was tried and rejected by looking at it: brightening the
+    match made it compete with the title and speckled the line, dimming the line it
+    sits in put the largest contrast inside one item, and dimming the whole list read
+    as too faint.
+    """
 
     def test_plain_when_colour_is_off(self):
         self.assertEqual(R.mark_terms("a 记忆 b", ["记忆"]), "a 记忆 b")
 
-    def test_dims_the_line_and_undims_the_match(self):
-        out = R.mark_terms("a 记忆 b", ["记忆"], color=True)
-        self.assertTrue(out.startswith(R.DIM))
-        self.assertIn(R.UNDIM + "记忆" + R.DIM, out)
-        self.assertTrue(out.endswith(R.RESET))
+    def test_colours_the_match_and_leaves_the_rest(self):
+        self.assertEqual(R.mark_terms("a 记忆 b", ["记忆"], color=True),
+                         "a " + R.YELLOW + "记忆" + R.FG_DEFAULT + " b")
 
-    def test_uses_no_bold(self):
-        self.assertNotIn("\033[1m", R.mark_terms("a 记忆 b", ["记忆"], color=True))
+    def test_does_not_touch_intensity(self):
+        """No dim (2), no bold (1), no intensity reset (22): the line keeps whatever
+        brightness it already had, which is what makes it safe inside the dim gutter
+        as well as outside it."""
+        out = R.mark_terms("a 记忆 b", ["记忆"], color=True)
+        for code in ("\033[2m", "\033[1m", "\033[22m"):
+            self.assertNotIn(code, out)
 
     def test_case_insensitive(self):
-        self.assertIn(R.UNDIM + "Memory", R.mark_terms("a Memory b", ["memory"],
-                                                       color=True))
+        self.assertIn(R.YELLOW + "Memory", R.mark_terms("a Memory b", ["memory"],
+                                                        color=True))
 
     def test_a_digit_term_cannot_corrupt_the_escape_codes(self):
         """One combined pass, so a later term cannot match inside a code just added."""
         out = R.mark_terms("dial 2 then 22", ["2"], color=True)
-        self.assertNotIn("\033[" + R.UNDIM, out)
+        self.assertNotIn("\033[" + R.YELLOW, out)
         self.assertIn("dial", out)
 
-    def test_no_terms_still_dims(self):
-        self.assertEqual(R.mark_terms("plain", [], color=True),
-                         R.DIM + "plain" + R.RESET)
+    def test_no_terms_is_a_no_op(self):
+        self.assertEqual(R.mark_terms("plain", [], color=True), "plain")
+
+
+class TestColourHierarchy(unittest.TestCase):
+    """Intensity marks the metadata gutter and nothing else; hue marks meaning.
+
+    Ranking rows by brightness does not work in a list, because it applies to every
+    row: twenty bright titles are a wall rather than a landmark. Separation between
+    items is what makes it scannable, and that is structural -- see the gap in
+    _choose -- which leaves brightness with only one job, telling metadata from
+    content.
+    """
+
+    def setUp(self):
+        self.hit = R.list_sessions(
+            {"s": spec("s", cwd="/w/proj-name", title="记忆系统的设计")},
+            all_dirs=True,
+            matches={"s": {"hits": 7, "snippet": "…谈到了记忆的遗忘机制…"}})
+
+    def _item(self):
+        return R.format_rows(self.hit, cols=100, searching=True, terms=["记忆"],
+                             color=True)[0]
+
+    def test_the_gutter_is_dim(self):
+        top, bottom = self._item().split("\n")
+        self.assertTrue(top.startswith(R.DIM))
+        self.assertTrue(bottom.startswith(R.DIM))
+
+    def test_the_hit_count_is_magenta(self):
+        """The sort key, told from the date beside it without having to read it."""
+        top = self._item().split("\n")[0]
+        self.assertIn(R.MAGENTA + "7x" + R.FG_DEFAULT, top)
+
+    def test_the_hit_count_closes_without_ending_the_dim(self):
+        """SGR 39 after it, not SGR 0 -- the dim has to reach the end of the gutter."""
+        top = self._item().split("\n")[0]
+        self.assertEqual(top.count(R.DIM), 1)
+        self.assertLess(top.index(R.MAGENTA), top.index(R.RESET))
+
+    def test_the_content_is_not_dim(self):
+        """Neither the title nor the sentence, or the contrast lands inside one item."""
+        top, bottom = self._item().split("\n")
+        self.assertTrue(top.endswith(R.RESET + "记忆系统的设计"), top[-40:])
+        self.assertNotIn(R.DIM, bottom[bottom.index(R.RESET):])
+
+    def test_yellow_means_only_the_match(self):
+        item = self._item()
+        self.assertEqual(item.count(R.YELLOW), 1)
+        self.assertIn(R.YELLOW + "记忆", item.split("\n")[1])
+
+    def test_the_project_is_cyan(self):
+        self.assertIn(R.CYAN + "proj-name", self._item())
+
+    def test_no_explicit_grey_is_used(self):
+        """A 256-colour ramp assumes a dark background; this is published code."""
+        self.assertNotIn("\033[38;5;", self._item())
 
 
 class TestBuildQuery(unittest.TestCase):

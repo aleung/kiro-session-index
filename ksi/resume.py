@@ -66,6 +66,19 @@ from . import text as T
 # where display happens.
 SNIP_CONTEXT = 400
 
+# The metadata column, carried down the left of both of an item's lines: when and how
+# many on the first, which project on the second. Splitting it over two lines is what
+# makes it affordable -- inline on one line the same three fields cost 37 columns, and
+# they pushed the title to a different column on every row, since the project name's
+# width varies. 19 columns fits 97.6% of project names in the corpus without truncation
+# (12 alone would fit 74.6%), plus two of separation.
+#
+# What this buys is one content column with a stable left edge: the title and the
+# sentence below it start at the same place on every row, which is what lets the list be
+# read down rather than hunted through.
+GUTTER = 21
+PROJECT_CAP = GUTTER - 2
+
 # Columns a snippet line gets even on an absurdly narrow terminal, and the width of
 # the line number the numbered-menu path prefixes ('NN  ').
 MIN_SNIPPET_ROOM = 20
@@ -78,14 +91,35 @@ LINENO_WIDTH = 4
 DEFAULT_LIMIT_LIST = 20
 DEFAULT_LIMIT_SEARCH = 50
 
-SNIPPET_INDENT = "    "
-
-# Intensity, not colour. UNDIM is SGR 22 ("normal intensity"), which is why the
-# matched term is marked by clearing the dim rather than by adding bold -- see
-# mark_terms.
+# Intensity marks one thing, hue marks the rest, and structure does the ranking.
+#
+# Dim is for the metadata gutter down the left -- when, how many, which project -- and
+# nothing else. Everything that is content renders at the terminal's own brightness. Two
+# other splits were tried on screen first and both failed: a bright title over a dim
+# snippet puts the screen's largest contrast inside a single item, on the line you are
+# *not* meant to read; dimming all of it instead reads as uniformly too faint. What makes
+# the list scannable is the blank row between items, which is `_choose`'s job, not a
+# brightness scale's.
+#
+# Three hues, each meaning one thing and appearing nowhere else: magenta the hit count,
+# cyan the project, yellow the matched term. Magenta rather than green for the count
+# because green and cyan are close enough to be confused in many themes, and those two
+# sit one line apart in the same column.
+#
+# Only the dim attribute is used, never an explicit grey. A 256-colour ramp would give
+# finer control -- and would let the snippet sit one step above the title, which dim
+# cannot express -- but it assumes a dark background, and this is published code that
+# has to survive a light theme.
+#
+# FG_DEFAULT is SGR 39, which resets the foreground colour and leaves intensity alone.
+# That is what lets a coloured span be safe both inside a dim run and outside one -- the
+# gutter relies on it to colour one field without ending the dim that covers the rest.
 DIM = "\033[2m"
-UNDIM = "\033[22m"
 RESET = "\033[0m"
+CYAN = "\033[36m"
+MAGENTA = "\033[35m"
+YELLOW = "\033[33m"
+FG_DEFAULT = "\033[39m"
 
 
 def load_sessions(sessions_dir=None):
@@ -180,13 +214,29 @@ def truncate(s, max_w):
     return "".join(out) + "…"
 
 
-def snippet_room(cols):
-    """Display columns the snippet line has to fill, on a terminal `cols` wide.
+def pad(s, width):
+    """Cut to `width` display columns, then pad with spaces to exactly that many."""
+    s = truncate(s, width)
+    return s + " " * max(width - display_width(s), 0)
 
-    Its own indent, and the line number the numbered-menu path prefixes to the first
-    line of an item -- charged to both lines so the two stay aligned.
+
+def gutter_width(cols):
+    """Columns given to the metadata column on a terminal `cols` wide.
+
+    It yields rather than squeezing the content: below about 45 columns there is not
+    enough room for both, and a legible sentence beside a truncated project name beats
+    a full project name beside four words.
     """
-    return max(cols - display_width(SNIPPET_INDENT) - LINENO_WIDTH, MIN_SNIPPET_ROOM)
+    return max(min(GUTTER, cols - LINENO_WIDTH - MIN_SNIPPET_ROOM), 0)
+
+
+def snippet_room(cols):
+    """Display columns the content column has to fill, on a terminal `cols` wide.
+
+    The metadata gutter, and the line number the numbered-menu path prefixes to an
+    item -- charged to both of its lines, so the two stay aligned with each other.
+    """
+    return max(cols - LINENO_WIDTH - gutter_width(cols), MIN_SNIPPET_ROOM)
 
 
 def _fits(chars, budget):
@@ -274,12 +324,28 @@ def search_sessions(query, db=None, sessions_dir=None):
 
 
 def mark_terms(text, terms, color=False):
-    """Dim the whole snippet, at normal intensity only where the query matched.
+    """Colour the matched terms, leaving everything else exactly as it is.
 
-    Contrast comes from *removing* the dim rather than adding bold: ANSI keeps bold
-    and faint in one intensity slot and SGR 22 clears both, so bold nested inside
-    faint is undefined and terminals disagree about it. Un-dimming has one meaning
-    everywhere.
+    Three things this deliberately does not do, each having been tried and rejected by
+    looking at the result.
+
+    It does not brighten the match. Un-dimming made it as bright as the title, and a
+    term can occur three or four times in a sentence, so it scattered bright spots at
+    unpredictable positions along the line.
+
+    It does not dim the line it sits in. The snippet used to be dim under a
+    normal-intensity title, which put the screen's largest contrast between the two
+    lines of a single item -- pulling the eye off the line that says why the session
+    matched and onto the one that is only the opening prompt truncated.
+
+    And it does not dim everything instead, which was the next thing tried: with no
+    contrast left the whole list read as too faint. What actually made the list
+    scannable was separating the items (see _choose) rather than ranking them by
+    brightness. So intensity now says one thing only -- the metadata gutter is dim, the
+    content is not -- and hue is what marks meaning.
+
+    The span closes with SGR 39 (default foreground), which resets the colour without
+    touching intensity, so this is safe to use inside a dim run as well as outside one.
 
     One pass over a combined pattern, not one pass per term: replacing term by term
     would let a later term match the digits inside an escape code already inserted.
@@ -288,9 +354,9 @@ def mark_terms(text, terms, color=False):
         return text
     wanted = [t for t in dict.fromkeys(terms) if t]
     if not wanted:
-        return DIM + text + RESET
+        return text
     pattern = re.compile("|".join(re.escape(t) for t in wanted), re.IGNORECASE)
-    return DIM + pattern.sub(lambda m: UNDIM + m.group(0) + DIM, text) + RESET
+    return pattern.sub(lambda m: YELLOW + m.group(0) + FG_DEFAULT, text)
 
 
 
@@ -350,37 +416,77 @@ def format_rows(rows, cols=100, show_cwd=False, searching=False, terms=(),
     Widths are display columns, not characters, or a CJK row wraps and the list stops
     being scannable. The snippet is cut the same way; the match sits at its centre, so
     a cut costs trailing context rather than the thing you were looking for.
+
+    Intensity says one thing: the metadata gutter on the left -- age and hit count --
+    is dim, and the content is not. Hue says the rest: cyan for "which project", yellow
+    for "this is why it matched".
+
+    Getting here took ruling out both ends. Ranking by brightness within an item does
+    not work, because a list applies it to every row: twenty bright titles are a wall
+    rather than a landmark, and a bright title above a dim snippet puts the screen's
+    largest contrast inside one item, on the wrong line of it. Dimming everything
+    instead reads as too faint. What separates the items is the blank row between them
+    (see _choose), which is a structural job, and once structure does it there is
+    nothing left for brightness to do.
+
+    The current row is marked by fzf's background band, which is enough on its own once
+    its bold is off -- and it works here because the content carries no dim of its own
+    for fzf's `fg+` to lose against.
     """
     if color:
-        dim, cyan, yellow, reset = DIM, "\033[36m", "\033[33m", RESET
+        dim, cyan, magenta, fg, reset = DIM, CYAN, MAGENTA, FG_DEFAULT, RESET
     else:
-        dim = cyan = yellow = reset = ""
+        dim = cyan = magenta = fg = reset = ""
 
     avail = cols - LINENO_WIDTH   # the caller prefixes a line number: 'NN  '
-    room = snippet_room(cols)
     out = []
     for r in rows:
-        used = 10
-        age_part = f"{dim}{r['age']:<8s}  {reset}"
-        hits_part = ""
         if searching:
-            shown = (str(r["hits"]) + "x").rjust(5) + " "
-            used += len(shown)
-            hits_part = f"{yellow}{shown}{reset}"
-        cwd_part = ""
-        if searching or show_cwd:
-            # Searching spends the width on the snippet instead, so the directory
-            # column shrinks to the project name -- enough to answer "which one".
-            shown = (project_of(r["cwd"]) if searching else short_path(r["cwd"])) + "  "
+            out.append(_search_row(r, cols, terms, color,
+                                   dim, cyan, magenta, fg, reset))
+            continue
+        # Listing has no sentence to show, so it stays one line and spends the width
+        # on a fuller path than the project name searching can afford.
+        used = 10
+        item = f"{dim}{r['age']:<8s}  {reset}"
+        if show_cwd:
+            shown = short_path(r["cwd"]) + "  "
             used += display_width(shown)
-            cwd_part = f"{cyan}{shown}{reset}"
-        item = (age_part + hits_part + cwd_part
-                + truncate(r["title"], max(avail - used, 10)))
-        if searching and r.get("snippet"):
-            item += "\n" + SNIPPET_INDENT + mark_terms(window(r["snippet"], terms, room),
-                                                       terms, color)
-        out.append(item)
+            item += f"{cyan}{shown}{reset}"
+        out.append(item + truncate(r["title"], max(avail - used, 10)))
     return out
+
+
+def _search_row(r, cols, terms, color, dim, cyan, magenta, fg, reset):
+    """One matching session as two lines: metadata gutter left, content right.
+
+    The gutter carries when and how many on the first line and which project on the
+    second, so the content column keeps a single left edge on both -- the title and
+    the sentence that says why the session matched start at the same column, on every
+    row. Inline on one line these three fields cost 37 columns and, because a project
+    name's width varies, put the title in a different place on each row.
+    """
+    gut = gutter_width(cols)
+    room = snippet_room(cols)
+
+    # The hit count is the one field with a hue, because it is the sort key: rows come
+    # ordered by it, and telling it from the date beside it should not need reading.
+    # fg, not reset, closes it -- the dim has to survive to the end of the gutter.
+    hits = f"{r['hits']}x"
+    # Age padded to a fixed width, or the count lands in a different column on every
+    # row -- '120d ago  14x' against '35d ago  12x' -- and a ragged column of numbers
+    # is exactly what a hue was added to stop you having to read.
+    when = f"{r['age']:<8s}  "
+    spent = display_width(when) + display_width(hits)
+    top = (when + magenta + hits + fg + " " * max(gut - spent, 0)
+           if spent <= gut else pad(when + hits, gut))
+
+    item = f"{dim}{top}{reset}" + truncate(r["title"], room)
+    if r.get("snippet"):
+        where = pad(truncate(project_of(r["cwd"]), PROJECT_CAP), gut)
+        item += ("\n" + f"{dim}{cyan}{where}{reset}"
+                 + mark_terms(window(r["snippet"], terms, room), terms, color))
+    return item
 
 
 # ------------------------------------------------------------------ selection
@@ -403,16 +509,30 @@ def _choose(display):
         # line to stdout -- that split is what lets its output be piped. Capturing
         # stderr here leaves fzf waiting for keystrokes with nothing on screen, which
         # to the user is indistinguishable from a hang.
-        # No --gap. In fzf 0.67 a gap is drawn as a dashed rule, and it costs a screen
-        # row per session -- 7 sessions visible in a 24-row terminal instead of 10.
-        # Nothing is lost by removing it: the snippet is indented and dimmed, and the
-        # current-item highlight covers both of an entry's lines, so which line belongs
-        # to which session stays unambiguous. (--gap=1 --gap-line= keeps the blank row
-        # without the rule, if the density ever turns out to be too tight.)
+        # A blank row between items, which reverses part of bdf17e2. That commit
+        # dropped --gap to buy density -- 10 sessions visible in a 24-row terminal
+        # instead of 7 -- on the argument that the indent and the dim already said
+        # which line belonged to which session. They do, read one item at a time; what
+        # they do not do is let you *scan*, because 20 items with no separation is one
+        # block of text and the eye finds no edges in it. Density was the wrong thing
+        # to spend the row on.
+        # --gap-line= is what keeps it a blank row: --gap=1 alone draws a dashed rule
+        # in fzf 0.67, which is the form bdf17e2 rejected and rightly so.
         proc = subprocess.run(
             ["fzf", "--ansi", "--read0", "--no-sort",
+             "--gap=1", "--gap-line=",
              "--prompt=resume session> ",
              "--header=Select a session to resume (Esc to cancel)",
+             # The current item is marked by its background band alone. fzf also bolds
+             # it by default, which is a third intensity on top of the two this list
+             # already uses, and it lands on text whose weight is carrying meaning --
+             # so the current row stops looking like the other rows just as you are
+             # scanning past it. Measured on the wire: the current item's own line goes
+             # from `1;38;5;254;48;5;236` to `38;5;254;48;5;236`, keeping the band; its
+             # snippet line goes from `1;2;...` -- bold nested inside faint, which ANSI
+             # leaves undefined -- to a plain `2`.
+             # `--highlight-line` is not this. It widens the band and keeps the bold.
+             "--color=fg+:regular",
              "--delimiter=\x1f", "--with-nth=2.."],
             input=payload, stdout=subprocess.PIPE, text=True)
         if proc.returncode != 0 or not proc.stdout.strip():
@@ -426,7 +546,11 @@ def _choose(display):
         first, _, rest = item.partition("\n")
         print(f"{i:2d}  {first}")
         if rest:
-            print(rest)
+            # The line number is charged to both lines, or the gutter on the second
+            # one starts four columns left of the first and the item stops being a
+            # block. snippet_room already leaves room for it.
+            print(" " * LINENO_WIDTH + rest)
+        print()          # separated like the fzf path, for the same reason
     print()
     try:
         raw = input("Number to resume (blank to cancel): ").strip()
