@@ -1,8 +1,6 @@
 ---
 name: session-history
-description: "Load when the user asks what was discussed or decided before, references earlier work you lack context for, resumes previous work, or when knowing prior decisions would improve your answer. Triggers: 'did we discuss', '之前讨论过', '继续之前的', 'have I seen this error', 'last time we'."
-metadata:
-  version: "1.1.0"
+description: "Past kiro sessions are a searchable index; this skill is the only correct way to read them. Load whenever you need a fact from an earlier session — what was discussed or decided, why, or what a past session did — instead of reading session logs yourself."
 ---
 
 # Session History
