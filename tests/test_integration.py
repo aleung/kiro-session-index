@@ -160,7 +160,7 @@ class TestRealCorpus(unittest.TestCase):
         self.assertLess(ms, 1000)
 
     def test_structural_query(self):
-        _, rows = Q.run_sql(
+        _, rows, _ = Q.run_sql(
             self.con,
             "SELECT s.project, count(*) AS n FROM tool_calls t"
             " JOIN sessions s USING(session_id) WHERE t.path IS NOT NULL"

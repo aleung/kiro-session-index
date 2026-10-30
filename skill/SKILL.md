@@ -20,9 +20,14 @@ which fails silently rather than erroring.
 @TOOL_DIR@/ksi-index --full                   # rebuild from scratch (~3 s)
 ```
 
-Flags: `-n` limit, `-w` snippet width, `--json`, `--project`, `--session`,
-`--role user|assistant`, `--since YYYY-MM-DD`, `--tool-name`, `--tool-status error`,
-`--with TOKEN` (whole-word prefilter; makes `-l` sub-millisecond), `--no-update`.
+Flags: `-n` row cap (default 10; 200 for `--sql`), `-w` snippet width, `--json`,
+`--project`, `--session`, `--role user|assistant`, `--since YYYY-MM-DD`, `--tool-name`,
+`--tool-status error`, `--with TOKEN` (whole-word prefilter; makes `-l` sub-millisecond),
+`--no-update`.
+
+When the cap cuts a result short, `ksi-query` prints `[truncated at N rows; pass -n to
+raise or lower]` to stderr (stdout, including `--json`, stays clean). A silent result is
+therefore complete — treat the notice, not the row count, as the signal to widen `-n`.
 
 ## Query without being asked
 

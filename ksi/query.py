@@ -29,6 +29,14 @@ from . import text as T
 # appear in the SQL text, so matching on the SQL string cannot false-positive.
 _BANNED = re.compile(r"(?i)\b(snippet|highlight)\s*\(")
 
+# Default row cap per mode. Prose, tool-output, and --like answer "show me the best
+# few", so a small cap keeps synthesis cheap. --sql is aggregate or exploratory --
+# "count these", "list every session that..." -- where a 10-row cap silently drops
+# the answer, so it gets a much larger one. A --limit/-n on the command line overrides
+# whichever applies. Every mode reports when its cap actually cut a result short.
+PROSE_LIMIT = 10
+SQL_LIMIT = 200
+
 
 class QueryError(Exception):
     pass
@@ -256,12 +264,19 @@ def sessions_matching(con, query, snip_width=30):
             for r in con.execute(sql, [match])}
 
 
-def run_sql(con, sql, limit=200):
+def run_sql(con, sql, limit=SQL_LIMIT):
+    """Run arbitrary guarded SQL, capped at `limit` rows.
+
+    Fetches one row past the cap so the caller can tell a result that happens to
+    fill the cap from one the cap cut short. Returns (cols, rows, truncated);
+    `rows` holds at most `limit` entries.
+    """
     guard_sql(sql)
     cur = con.execute(sql)
-    rows = cur.fetchmany(limit)
+    rows = cur.fetchmany(limit + 1)
     cols = [d[0] for d in cur.description] if cur.description else []
-    return cols, [list(r) for r in rows]
+    truncated = len(rows) > limit
+    return cols, [list(r) for r in rows[:limit]], truncated
 
 
 def status(con, db_path=None, sessions_dir=None):
@@ -302,6 +317,15 @@ def _clip(value, width=60):
     return s if len(s) <= width else s[: width - 1] + "…"
 
 
+def _warn_truncated(limit):
+    """Tell the user, on stderr, that the cap cut the result short.
+
+    Same channel and bracket style as the '[index updated: ...]' line, so it stays
+    out of stdout -- including the --json stream, which must remain a clean list.
+    """
+    print(f"[truncated at {limit} rows; pass -n to raise or lower]", file=sys.stderr)
+
+
 def _print_rows(rows, keys):
     if not rows:
         print("(no matches)")
@@ -328,7 +352,8 @@ def main(argv=None):
                    help="whole-word FTS prefilter to speed up --like")
     p.add_argument("--sql", metavar="SQL", help="arbitrary SQL (guarded)")
     p.add_argument("--status", action="store_true", help="index freshness and counts")
-    p.add_argument("-n", "--limit", type=int, default=10)
+    p.add_argument("-n", "--limit", type=int, default=None,
+                   help=f"max rows (default {PROSE_LIMIT}; {SQL_LIMIT} for --sql)")
     p.add_argument("-w", "--width", type=int, default=40, help="snippet context width")
     p.add_argument("--session", help="restrict to one session_id")
     p.add_argument("--project", help="restrict to one project")
@@ -369,7 +394,8 @@ def main(argv=None):
             return 0
 
         if args.sql:
-            cols, rows = run_sql(con, args.sql, args.limit)
+            limit = args.limit if args.limit is not None else SQL_LIMIT
+            cols, rows, truncated = run_sql(con, args.sql, limit)
             if args.json:
                 print(json.dumps([dict(zip(cols, r)) for r in rows],
                                  indent=2, ensure_ascii=False, default=str))
@@ -377,16 +403,22 @@ def main(argv=None):
                 print(" | ".join(cols))
                 for r in rows:
                     print(" | ".join("" if v is None else str(v) for v in r))
+            if truncated:
+                _warn_truncated(limit)
             return 0
 
+        # Prose, tool-output, and --like share one default and one truncation check.
+        # Each asks its search for one row past the cap, so a result that exactly
+        # fills the cap is told apart from one the cap cut short.
+        limit = args.limit if args.limit is not None else PROSE_LIMIT
         if args.like:
-            rows = search_like(con, args.like, args.limit, args.width,
+            rows = search_like(con, args.like, limit + 1, args.width,
                                tool_output=args.tool, prefilter=args.prefilter)
             keys = ["title", "project", "tool"]
         elif args.tool:
             if not args.query:
                 p.error("a query is required")
-            rows = search_tool_output(con, args.query, args.limit, args.width,
+            rows = search_tool_output(con, args.query, limit + 1, args.width,
                                       tool=args.tool_name, status=args.tool_status,
                                       project=args.project)
             keys = ["title", "project", "tool", "status", "purpose", "path"]
@@ -394,15 +426,19 @@ def main(argv=None):
             if not args.query:
                 p.print_help()
                 return 1
-            rows = search_prose(con, args.query, args.limit, args.width,
+            rows = search_prose(con, args.query, limit + 1, args.width,
                                 session=args.session, project=args.project,
                                 since=since, role=args.role)
             keys = ["when", "title", "project", "role", "content_type"]
 
+        truncated = len(rows) > limit
+        rows = rows[:limit]
         if args.json:
             print(json.dumps(rows, indent=2, ensure_ascii=False))
         else:
             _print_rows(rows, keys)
+        if truncated:
+            _warn_truncated(limit)
         return 0
     except (QueryError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)

@@ -191,13 +191,23 @@ class TestSearchLike(QueryCase):
 
 class TestRunSql(QueryCase):
     def test_returns_columns_and_rows(self):
-        cols, rows = Q.run_sql(self.con, "SELECT session_id FROM sessions")
+        cols, rows, truncated = Q.run_sql(self.con, "SELECT session_id FROM sessions")
         self.assertEqual(cols, ["session_id"])
         self.assertEqual(len(rows), 3)
+        self.assertFalse(truncated)
 
     def test_enforces_limit(self):
-        _, rows = Q.run_sql(self.con, "SELECT id FROM messages", limit=2)
+        _, rows, truncated = Q.run_sql(self.con, "SELECT id FROM messages", limit=2)
         self.assertEqual(len(rows), 2)
+        self.assertTrue(truncated)
+
+    def test_full_result_is_not_flagged_truncated(self):
+        # Exactly the row count under a matching cap: complete, not truncated.
+        n = self.con.execute("SELECT count(*) FROM sessions").fetchone()[0]
+        _, rows, truncated = Q.run_sql(
+            self.con, "SELECT session_id FROM sessions", limit=n)
+        self.assertEqual(len(rows), n)
+        self.assertFalse(truncated)
 
     def test_guard_applies(self):
         with self.assertRaises(Q.QueryError):
@@ -205,14 +215,14 @@ class TestRunSql(QueryCase):
                                 " FROM messages_fts")
 
     def test_structural_query_works(self):
-        cols, rows = Q.run_sql(
+        cols, rows, _ = Q.run_sql(
             self.con,
             "SELECT s.title, t.name, t.path FROM tool_calls t"
             " JOIN sessions s USING(session_id) ORDER BY s.created_at")
         self.assertEqual(len(rows), 3)
 
     def test_lineage_query_works(self):
-        _, rows = Q.run_sql(
+        _, rows, _ = Q.run_sql(
             self.con, "SELECT session_id FROM sessions"
                       " WHERE parent_session_id IS NOT NULL")
         self.assertEqual(len(rows), 2)
@@ -337,6 +347,84 @@ class TestCli(unittest.TestCase):
         code, out, _ = self.run_cli("--sql", "SELECT count(*) AS n FROM sessions")
         self.assertEqual(code, 0)
         self.assertIn("2", out)
+
+
+class TestCliLimit(unittest.TestCase):
+    """The default limit is mode-aware, and a capped result says so.
+
+    The handoff bug: --sql inherited the prose default of 10 and silently dropped
+    the rest, so an aggregate or exploratory query looked like an incomplete index.
+    A corpus of 8 sessions yields 40 message rows -- more than any mode's default
+    cap of 10 -- so a bare row dump exposes both halves of the bug.
+    """
+
+    def setUp(self):
+        self.c = F.Corpus(8)
+        self.c.__enter__()
+        I.update(db_path=self.c.db, sessions_dir=self.c.root, full=True)
+        self.base = ["--db", self.c.db, "--sessions", self.c.root, "--no-update"]
+        self.total = self.con_count()
+
+    def con_count(self):
+        con, _ = Q.open_index(self.c.db, auto_update=False)
+        try:
+            return con.execute("SELECT count(*) FROM messages").fetchone()[0]
+        finally:
+            con.close()
+
+    def tearDown(self):
+        self.c.__exit__()
+
+    def run_cli(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = Q.main(list(args) + self.base)
+        return code, out.getvalue(), err.getvalue()
+
+    def _data_rows(self, out):
+        # First stdout line is the column header; the rest are data rows.
+        lines = [l for l in out.splitlines() if l != ""]
+        return lines[1:]
+
+    def test_sql_default_is_not_the_prose_ten(self):
+        self.assertGreater(self.total, 10)  # guard: the corpus can expose the bug
+        code, out, _ = self.run_cli("--sql", "SELECT id FROM messages")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self._data_rows(out)), self.total)
+
+    def test_sql_capped_reports_truncation_on_stderr(self):
+        code, out, err = self.run_cli("-n", "2", "--sql", "SELECT id FROM messages")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self._data_rows(out)), 2)
+        self.assertIn("truncated", err.lower())
+
+    def test_sql_uncapped_says_nothing_about_truncation(self):
+        code, _, err = self.run_cli("--sql", "SELECT id FROM messages LIMIT 3")
+        self.assertEqual(code, 0)
+        self.assertNotIn("truncated", err.lower())
+
+    def test_sql_exactly_at_limit_is_not_flagged(self):
+        # N rows under -n N is complete, not truncated: fetching N+1 finds no extra.
+        code, _, err = self.run_cli("-n", str(self.total),
+                                    "--sql", "SELECT id FROM messages")
+        self.assertEqual(code, 0)
+        self.assertNotIn("truncated", err.lower())
+
+    def test_sql_json_stdout_stays_a_clean_list_when_truncated(self):
+        import json
+        code, out, err = self.run_cli("-n", "2", "--json",
+                                      "--sql", "SELECT id FROM messages")
+        self.assertEqual(code, 0)
+        parsed = json.loads(out)  # stdout must remain valid JSON
+        self.assertEqual(len(parsed), 2)
+        self.assertIn("truncated", err.lower())
+
+    def test_prose_capped_reports_truncation(self):
+        # Every synthetic session contains the phrase, so 8 sessions > default 10? no;
+        # cap explicitly at 1 to force the notice.
+        code, _, err = self.run_cli("-n", "1", "遗忘机制")
+        self.assertEqual(code, 0)
+        self.assertIn("truncated", err.lower())
 
 
 if __name__ == "__main__":
