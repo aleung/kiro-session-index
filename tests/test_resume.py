@@ -155,6 +155,63 @@ class TestLoadSessions(unittest.TestCase):
             self.assertEqual(set(R.load_sessions(tmp)), {"used"})
 
 
+class TestV3Sessions(unittest.TestCase):
+    """kiro-resume over a sessions root holding both the v2 and the v3 layout."""
+
+    def setUp(self):
+        self.c = F.MixedCorpus(n_v2=2, n_v3=2)
+        self.c.__enter__()
+
+    def tearDown(self):
+        self.c.__exit__(None, None, None)
+
+    def test_lists_both_formats(self):
+        got = R.load_sessions(self.c.root)
+        self.assertEqual(set(got), set(self.c.v2_ids) | set(self.c.v3_ids))
+
+    def test_v3_metadata_in_v2_shape(self):
+        meta = R.load_sessions(self.c.root)[self.c.v3_ids[1]]
+        self.assertEqual(meta, {
+            "session_id": self.c.v3_ids[1], "cwd": "/home/u/projects/v3proj1",
+            "title": "v3 session 1", "created_at": "2026-11-07T03:18:00.000Z",
+            "updated_at": "2026-11-07T03:19:00.000Z", "parent_session_id": None})
+
+    def test_v3_subagent_transcript_is_not_listed(self):
+        self.assertNotIn(F.V3_SUB_ID, R.load_sessions(self.c.root))
+
+    def test_empty_v3_log_is_not_listed(self):
+        open(self.c.v3_log(self.c.v3_ids[1]), "w").close()
+        self.assertNotIn(self.c.v3_ids[1], R.load_sessions(self.c.root))
+
+    def test_corrupt_v3_metadata_is_skipped_not_fatal(self):
+        p = os.path.join(os.path.dirname(self.c.v3_log(self.c.v3_ids[1])), "session.json")
+        with open(p, "w") as fh:
+            fh.write("{ not json")
+        got = R.load_sessions(self.c.root)
+        self.assertNotIn(self.c.v3_ids[1], got)
+        self.assertIn(self.c.v3_ids[0], got)
+
+    def test_v3_session_listed_in_its_directory(self):
+        rows = R.list_sessions(R.load_sessions(self.c.root),
+                               cwd="/home/u/projects/v3proj0")
+        self.assertEqual([r["session_id"] for r in rows], [self.c.v3_ids[0]])
+        self.assertNotEqual(rows[0]["age"], "?")
+
+    def test_search_finds_v3_sessions_but_not_subagents(self):
+        matches = R.search_sessions("遗忘机制", db=self.c.db, sessions_dir=self.c.root)
+        self.assertIn(F.V3_SUB_ID, R.search_sessions(
+            "子代理正在获取日志", db=self.c.db, sessions_dir=self.c.root))
+        rows = R.list_sessions(R.load_sessions(self.c.root), all_dirs=True,
+                               matches=matches)
+        ids = {r["session_id"] for r in rows}
+        self.assertEqual(ids, set(self.c.v2_ids[:1]) | set(self.c.v3_ids))
+        sub_rows = R.list_sessions(
+            R.load_sessions(self.c.root), all_dirs=True,
+            matches=R.search_sessions("子代理正在获取日志", db=self.c.db,
+                                      sessions_dir=self.c.root))
+        self.assertEqual(sub_rows, [])
+
+
 class TestHasContent(unittest.TestCase):
     def test_empty_log_has_nothing_to_resume(self):
         with tempfile.TemporaryDirectory() as tmp:

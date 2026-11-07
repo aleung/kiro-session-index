@@ -3,12 +3,12 @@
 Two properties here follow from the premise in DESIGN.md rather than from
 convenience, and both are easy to "simplify" away later.
 
-The session list is built from the `.json` sidecars, never from the index's
-`sessions` table. The sidecars are the source of truth for which sessions exist;
-the table is a derived cache, populated only for sessions whose `.jsonl` was
-parsed. A launcher that cannot list your sessions because a cache is cold or
-incomplete is a broken launcher, so the default listing does not open the index
-at all.
+The session list is built from the session metadata files -- v2 `.json` sidecars and
+v3 `session.json` -- never from the index's `sessions` table. They are the source of
+truth for which sessions exist; the table is a derived cache, populated only for
+sessions whose log was parsed. A launcher that cannot list your sessions because a
+cache is cold or incomplete is a broken launcher, so the default listing does not open
+the index at all.
 
 Searching does need the index, and when it is unavailable the failure is loud
 rather than quietly downgraded. An earlier version fell back to grepping the raw
@@ -136,10 +136,15 @@ def load_sessions(sessions_dir=None):
 
     Unreadable sidecars are skipped rather than fatal: one corrupt file must not make
     the whole list unavailable.
+
+    Both layouts are read. v3 metadata is reshaped into the v2 keys the rest of this
+    module uses, so nothing downstream needs to know which format a session came from.
+    v3 sub-agent transcripts live under their parent's sub-executions/ and have no
+    session.json of their own, so they never reach this list.
     """
-    sessions_dir = sessions_dir or I._sessions_dir()
+    root = sessions_dir or I._sessions_dir()
     out = {}
-    for path in glob.glob(os.path.join(sessions_dir, "*.json")):
+    for path in glob.glob(os.path.join(I.v2_dir(root), "*.json")):
         try:
             with open(path, encoding="utf8", errors="replace") as fh:
                 meta = json.load(fh)
@@ -151,7 +156,44 @@ def load_sessions(sessions_dir=None):
             continue
         sid = meta.get("session_id") or os.path.splitext(os.path.basename(path))[0]
         out[sid] = meta
+    for path in glob.glob(os.path.join(root, "*", "sess_*", "session.json")):
+        sess_dir = os.path.dirname(path)
+        if not has_content(os.path.join(sess_dir, "messages.jsonl")):
+            continue
+        meta = v3_meta(path)
+        if meta is not None:
+            out[meta["session_id"]] = meta
     return out
+
+
+def v3_meta(path):
+    """A v3 session.json in the v2 sidecar shape, or None if it cannot be read.
+
+    The directory name is the session id, and it is the form `kiro-cli --resume-id`
+    takes. The working directory is the first workspace path, falling back to the
+    first root path.
+    """
+    try:
+        with open(path, encoding="utf8", errors="replace") as fh:
+            j = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(j, dict):
+        return None
+    cwd = ""
+    for key in ("workspacePaths", "rootPaths"):
+        paths = j.get(key)
+        if isinstance(paths, list) and paths and isinstance(paths[0], str):
+            cwd = paths[0]
+            break
+    return {
+        "session_id": os.path.basename(os.path.dirname(path)),
+        "cwd": cwd,
+        "title": j.get("title"),
+        "created_at": j.get("createdAt"),
+        "updated_at": j.get("lastModifiedAt"),
+        "parent_session_id": None,
+    }
 
 
 def has_content(log_path):
