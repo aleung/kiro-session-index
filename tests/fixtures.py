@@ -140,6 +140,28 @@ class Corpus:
         st = os.stat(p)
         os.utime(p, (st.st_atime, st.st_mtime + 2))
 
+    def append_tool_results(self, session_id, outputs, tool="ExecuteCmd"):
+        """Append one ToolResults record carrying several outputs.
+
+        outputs is a list of (text, ok) pairs. Each becomes its own tool result, so
+        each is a distinct FTS row that competes for rank with the corpus's own.
+        """
+        p = os.path.join(self.root, f"{session_id}.jsonl")
+        self._appends = getattr(self, "_appends", 0) + 1
+        n = self._appends
+        results = {}
+        for i, (text, ok) in enumerate(outputs):
+            body = {"items": [{"Text": text}]}
+            results[f"{session_id}-x{n}-{i}"] = {
+                "tool": {"kind": {"BuiltIn": {tool: {"command": "true"}}}},
+                "result": {"Success": body} if ok else {"Error": body},
+            }
+        with open(p, "a", encoding="utf8") as f:
+            f.write(_rec("ToolResults", {
+                "message_id": f"{session_id}-x{n}", "results": results}) + "\n")
+        st = os.stat(p)
+        os.utime(p, (st.st_atime, st.st_mtime + 2))
+
     def duplicate_citation(self, session_id):
         """Append a record reusing an existing (message_id, content_index).
 

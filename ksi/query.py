@@ -126,23 +126,30 @@ def search_prose(con, query, limit=10, width=40, session=None, project=None,
 
 
 def search_tool_output(con, query, limit=10, width=40, tool=None, status=None,
-                       project=None):
+                       project=None, session=None):
+    """Full-text search over tool output, one row per tool result.
+
+    Every filter goes into the same query as MATCH, ahead of ORDER BY ... LIMIT, so
+    the cap applies to rows that already pass the filters. Filtering after the cap
+    returned zero rows for a rare match (an error among many successes) with no
+    truncation notice. The cap counts tool results, not distinct outputs, because
+    one deduplicated output can belong to several results.
+    """
     match = T.build_match(query)
     sql = [
-        "WITH hits AS (",
-        "  SELECT rowid AS oid, rank AS rk FROM tool_output_fts",
-        "  WHERE tool_output_fts MATCH ? ORDER BY rk LIMIT ?",
-        ")",
-        "SELECT h.oid, o.output, r.tool_use_id, r.session_id, r.tool_name, r.status,",
-        "       s.title, s.project, c.purpose, c.path, h.rk",
-        "FROM hits h",
-        "JOIN tool_output o ON o.id = h.oid",
-        "JOIN tool_results r ON r.output_id = h.oid",
+        "SELECT o.output, r.tool_use_id, r.session_id, r.tool_name, r.status,",
+        "       s.title, s.project, c.purpose, c.path",
+        "FROM tool_output_fts f",
+        "JOIN tool_output o ON o.id = f.rowid",
+        "JOIN tool_results r ON r.output_id = f.rowid",
         "LEFT JOIN sessions s ON s.session_id = r.session_id",
         "LEFT JOIN tool_calls c ON c.tool_use_id = r.tool_use_id",
-        "WHERE 1=1",
+        "WHERE tool_output_fts MATCH ?",
     ]
-    params = [match, limit]
+    params = [match]
+    if session:
+        sql.append("AND r.session_id = ?")
+        params.append(session)
     if tool:
         sql.append("AND r.tool_name = ?")
         params.append(tool)
@@ -152,7 +159,8 @@ def search_tool_output(con, query, limit=10, width=40, tool=None, status=None,
     if project:
         sql.append("AND s.project = ?")
         params.append(project)
-    sql.append("ORDER BY h.rk")
+    sql.append("ORDER BY f.rank LIMIT ?")
+    params.append(limit)
 
     terms = T.query_terms(query)
     out = []
@@ -420,7 +428,7 @@ def main(argv=None):
                 p.error("a query is required")
             rows = search_tool_output(con, args.query, limit + 1, args.width,
                                       tool=args.tool_name, status=args.tool_status,
-                                      project=args.project)
+                                      project=args.project, session=args.session)
             keys = ["title", "project", "tool", "status", "purpose", "path"]
         else:
             if not args.query:

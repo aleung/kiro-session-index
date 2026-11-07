@@ -163,6 +163,72 @@ class TestSearchToolOutput(QueryCase):
         self.assertEqual(
             Q.search_tool_output(self.con, "FILEREAD_PAYLOAD_MUST_BE_SKIPPED"), [])
 
+    def test_session_filter(self):
+        rows = Q.search_tool_output(self.con, "connection refused", session="sess0001")
+        self.assertEqual([r["session_id"] for r in rows], ["sess0001"])
+
+
+class TestToolOutputFiltersBeforeLimit(unittest.TestCase):
+    """Every filter narrows the candidates before the row cap, not after it.
+
+    The bug: the cap picked the top-ranked outputs from the whole index and the
+    filters then ran over those few. A rare match below them -- an error among
+    many successes -- came back as zero rows with no truncation notice, which the
+    skill tells the agent to read as "never happened".
+    """
+
+    # Short outputs outrank longer ones under bm25. Six noise outputs in sess0000
+    # (proj0) fill any cap up to 6, so everything else ranks below them.
+    NOISE = [(f"connection refused {i}", True) for i in range(6)]
+    TARGET = "connection refused " + "while waiting for the server to come back " * 8
+
+    def setUp(self):
+        self.c = F.Corpus(3)
+        self.c.__enter__()
+        self.c.append_tool_results("sess0000", self.NOISE)
+        self.c.append_tool_results("sess0001", [(self.TARGET, False)], tool="Grep")
+        I.update(db_path=self.c.db, sessions_dir=self.c.root, full=True)
+        self.con, _ = Q.open_index(self.c.db, auto_update=False)
+
+    def tearDown(self):
+        self.con.close()
+        self.c.__exit__()
+
+    def search(self, limit=3, **filters):
+        return Q.search_tool_output(self.con, "connection refused", limit=limit,
+                                    **filters)
+
+    def test_fixture_ranks_noise_first(self):
+        self.assertEqual({r["session_id"] for r in self.search()}, {"sess0000"})
+
+    def test_status(self):
+        rows = self.search(status="error")
+        self.assertEqual([(r["session_id"], r["status"]) for r in rows],
+                         [("sess0001", "error")])
+
+    def test_tool(self):
+        rows = self.search(tool="Grep")
+        self.assertEqual([(r["session_id"], r["tool"]) for r in rows],
+                         [("sess0001", "Grep")])
+
+    def test_session(self):
+        # sess0001 holds the shared corpus output and the target.
+        rows = self.search(session="sess0001")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r["session_id"] for r in rows}, {"sess0001"})
+
+    def test_project(self):
+        # proj1 is sess0001 alone.
+        rows = self.search(project="proj1")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r["project"] for r in rows}, {"proj1"})
+
+    def test_limit_counts_result_rows(self):
+        # One deduplicated output seen by three sessions is three rows, and the
+        # cap must count those, or a full page would print no truncation notice.
+        rows = Q.search_tool_output(self.con, "port 5480", limit=2)
+        self.assertEqual(len(rows), 2)
+
 
 class TestSearchLike(QueryCase):
     def test_finds_identifier_substring_that_match_cannot(self):
@@ -338,6 +404,13 @@ class TestCli(unittest.TestCase):
         code, out, _ = self.run_cli("-t", "connection refused")
         self.assertEqual(code, 0)
         self.assertIn("ExecuteCmd", out)
+
+    def test_tool_mode_honours_session(self):
+        import json
+        code, out, _ = self.run_cli("-t", "connection refused", "--json",
+                                    "--session", "sess0001")
+        self.assertEqual(code, 0)
+        self.assertEqual({r["session_id"] for r in json.loads(out)}, {"sess0001"})
 
     def test_bad_since_is_rejected(self):
         with self.assertRaises(SystemExit):
