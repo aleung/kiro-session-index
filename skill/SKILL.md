@@ -5,8 +5,6 @@ description: "Past kiro sessions are a searchable index; this skill is the only 
 
 # Session History
 
-SQLite index over `~/.kiro/sessions/cli/*.jsonl`. Tools: `@TOOL_DIR@`.
-
 Run every query through `ksi-query`. Never open the database with `sqlite3` — that
 bypasses the CJK query transform, the freshness check, and the `snippet()` guard, each of
 which fails silently rather than erroring.
@@ -63,7 +61,7 @@ Prose and tool output are separate indexes. Query the wrong one and you get zero
 
 - "Why did we decide X", "what did we say about Y" → default (prose).
 - "Have I seen this error", "what did that command print" → `-t`.
-- Contents of a file that still exists → neither; use ripgrep. `FileRead` output is not indexed.
+- Contents of a file that still exists → neither; use ripgrep. File-read output is not indexed.
 
 ## Query syntax
 

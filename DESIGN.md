@@ -85,9 +85,10 @@ so the entry point finds the package beside its real location, not beside the li
 Three consequences of the Premise show up in `kiro-resume` specifically,
 and each one looks like a candidate for simplification until you remember why:
 
-**The session list comes from the `.json` sidecars, not from the `sessions` table.**
-The sidecars are the source of truth for which sessions exist;
-the table is populated only while parsing a `.jsonl`,
+**The session list comes from the session metadata files, not from the `sessions` table.**
+These are the v2 `.json` sidecars and the v3 `session.json` files.
+They are the source of truth for which sessions exist;
+the table is populated only while parsing a log,
 so a session with no messages yet has no row.
 Listing from the cache would mean a cold or partial index hides sessions from a
 launcher, which is the one thing a launcher may not do.
@@ -252,6 +253,64 @@ So usage analytics are not merely unbuilt, they are unavailable — and an aggre
 file bodies.
 Only `__tool_use_purpose` (0.48 MB) is written language, and it is the highest-value
 search target: a one-line intent written per tool call.
+
+## v3 session log layout
+
+Kiro CLI v3 moved the logs. Both layouts are read from one sessions root
+(`~/.kiro/sessions`, or `KSI_SESSIONS`), and both map onto the same tables and
+vocabulary, so no query needs to know which format a session came from.
+Reverse-engineered from a small corpus (23 sessions); re-verify as it grows.
+
+| | v2 | v3 |
+|---|---|---|
+| Log | `cli/<id>.jsonl` | `<hash>/sess_<uuid>/messages.jsonl` |
+| Metadata | `cli/<id>.json`, snake_case | `session.json` beside the log, camelCase |
+| Sub-agent | own log, `parent_session_id` in its sidecar | `sub-executions/<uuid>.jsonl` inside the parent's directory |
+| Record | `{version, kind, data}`, several content items | `{id, timestamp, payload}`, one event per record |
+| Timestamp | `Prompt` only, epoch seconds | every record, ISO-8601 |
+
+`cli/` still exists under v3 but holds only small `.history` files, not logs.
+`v2_dir()` falls back to the root itself when there is no `cli/`, so a sessions dir
+that *is* a v2 log directory still works.
+
+**Event mapping.** `payload.type` names the event:
+
+| v3 event | Indexed as |
+|---|---|
+| `user` | `Prompt` / `user` / `text` |
+| `assistant`, `operationType=Say` | `AssistantMessage` / `assistant` / `text` |
+| `assistant`, `operationType=Reasoning` | `AssistantMessage` / `assistant` / `thinking` |
+| `tool_call` | `tool_calls` row; purpose as `toolUse` prose |
+| `tool_result` | `tool_results`; `success` bool to `success`/`error` |
+| `sub_agent_start` / `sub_agent_complete` | parent's tool call `sub_agent` and its result |
+| everything else | skipped |
+
+The skipped events are not prose: turn boundaries, usage, `session_start` (the system
+prompt), `agent_note` (injected context), consent prompts, hook runs.
+`reasoningSignature` is the v3 signature blob and is never stored.
+`read_file` is v3's `FileRead` and is skipped for the same reason.
+
+**Citation anchor.** The record `id` with `content_index` 0, since a v3 record carries
+one item. A sub-agent's task prompt has no record of its own in the child's
+transcript; it is anchored on the child's session id.
+
+**Tool purpose.** v3 tools have no `__tool_use_purpose`.
+The agent-written intent is `args.description` (shell) or `args.explanation`
+(search, listing). `title` is not used: for most tools it is a fixed label such as
+"Read File".
+
+**Sub-agent metadata.** A transcript under `sub-executions/` has no sidecar.
+Its title, agent name, and start time come from the parent's `sub_agent_start`, its
+end time from `sub_agent_complete`, and its cwd and model from the parent's
+`session.json`. Only the transcript's own mtime is the cursor, as for v2.
+
+**Not read.** `snapshots/`, `.index/index.json`, `dashboard-search.db`, and
+`~/.kiro/session-index/`: v3's own caches and file snapshots, not conversation.
+
+**`kiro-resume`.** It lists v3 sessions from `session.json`
+(reshaped into the v2 sidecar keys by `resume.v3_meta`) and resumes them with
+`kiro-cli chat --resume-id sess_<uuid>`, the id form kiro-cli v3 itself reports.
+v3 sub-agent transcripts have no `session.json`, so they never reach the list.
 
 ## Data model
 

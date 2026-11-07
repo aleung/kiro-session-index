@@ -26,7 +26,8 @@ Two entry points, for the two things you want from a session you half-remember:
 | A past decision quoted into what you are doing now | ask the agent — the `session-history` skill triggers on its own, or invoke it with `/session-history` | inside a Kiro CLI conversation |
 | To reopen that session and carry on | run `kiro-resume` | at the shell |
 
-Install with `./setup.sh` (below), then use either one. Handles Chinese, English, and
+Install with `./setup.sh` (below), then use either one. Supports Kiro CLI v2 and v3
+session logs, including a mix of both from an upgrade. Handles Chinese, English, and
 code. Python3 stdlib only — no packages to install. (`kiro-resume` also wants `kiro-cli`
 itself, and will use `fzf` for selection if you have it.)
 
@@ -128,7 +129,7 @@ To refresh or rebuild by hand — `ksi-index` is not on your PATH, so spell it o
 | The index | `~/.cache/kiro-session-index/` |
 | Installed tools and skill | `~/.kiro/skills/session-history/` |
 | `kiro-resume`, `ksi-query` on PATH | `~/bin/` (symlinks into the above) |
-| Your session logs (read-only) | `~/.kiro/sessions/cli/` |
+| Your session logs (read-only) | `~/.kiro/sessions/`: v2 in `cli/`, v3 in `<hash>/sess_*/` |
 
 The index is a cache. Deleting it is safe — the next query rebuilds it from your logs,
 which are never modified.
