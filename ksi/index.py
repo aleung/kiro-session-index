@@ -5,9 +5,20 @@ file changes, its ENTIRE session is deleted and re-parsed, so the result is alwa
 byte-for-byte equivalent to a full rebuild. There is no byte offset to drift out of
 sync and silently drop records.
 
+Two upstream layouts are read, both under one sessions root:
+
+  v2  <root>/cli/<id>.jsonl + <id>.json sidecar   records {version, kind, data}
+  v3  <root>/<hash>/sess_<uuid>/messages.jsonl    records {id, timestamp, payload}
+      + session.json, and sub-agent transcripts in sub-executions/<uuid>.jsonl
+
+Both map onto the same tables and the same vocabulary (kind, role, content_type), so
+a query never has to know which format a session came from.
+
 Never writes to ~/.kiro/sessions -- the source is treated as read-only truth.
 """
 
+import collections
+import datetime
 import glob
 import hashlib
 import json
@@ -17,17 +28,35 @@ import time
 
 from . import text as T
 
-DEFAULT_SESSIONS = os.path.expanduser("~/.kiro/sessions/cli")
+DEFAULT_SESSIONS = os.path.expanduser("~/.kiro/sessions")
 DEFAULT_DB = os.path.expanduser("~/.cache/kiro-session-index/index.db")
 SCHEMA_VERSION = "3"
 
+# v2 keeps its logs in this subdirectory of the sessions root.
+V2_SUBDIR = "cli"
+
 # FileRead output duplicates files that still exist on disk, where ripgrep searches
 # them better and fresher. 12.76 MB of the 33.6 MB of tool output, for near-zero value.
-SKIP_TOOLS = {"FileRead"}
+# read_file is the same tool under its v3 name.
+SKIP_TOOLS = {"FileRead", "read_file"}
 
 # Record kinds that must never become messages:
 #   Compaction -- messages_snapshot is a duplicate copy of earlier messages.
 SKIP_KINDS = {"Compaction"}
+
+# v3 assistant records carry one item each; operationType says which kind.
+V3_ASSISTANT_TYPES = {"Say": "text", "Reasoning": "thinking"}
+
+# v3 tool-call arguments that hold the agent-written intent, in preference order.
+# __tool_use_purpose is the v2 name; v3 tools use description or explanation.
+V3_PURPOSE_ARGS = ("__tool_use_purpose", "description", "explanation")
+
+# Tool name recorded for a v3 sub-agent delegation, which has no tool_call record.
+V3_SUBAGENT_TOOL = "sub_agent"
+
+# One source file. fmt is "v2", "v3", or "v3-sub"; parent is the containing session
+# for "v3-sub" and None otherwise.
+Source = collections.namedtuple("Source", "path session_id fmt parent")
 
 
 def _sessions_dir():
@@ -36,6 +65,81 @@ def _sessions_dir():
 
 def _db_path():
     return os.environ.get("KSI_DB", DEFAULT_DB)
+
+
+def v2_dir(sessions_dir=None):
+    """Where v2 logs live: <root>/cli when it exists, else the root itself.
+
+    Falling back to the root keeps a sessions dir that *is* a v2 log directory --
+    an older KSI_SESSIONS setting, or a test corpus -- working unchanged.
+    """
+    sessions_dir = sessions_dir or _sessions_dir()
+    sub = os.path.join(sessions_dir, V2_SUBDIR)
+    return sub if os.path.isdir(sub) else sessions_dir
+
+
+def discover(sessions_dir=None):
+    """Every indexable source file under the sessions root, as {path: Source}."""
+    root = sessions_dir or _sessions_dir()
+    out = {}
+    for path in glob.glob(os.path.join(v2_dir(root), "*.jsonl")):
+        out[path] = Source(path, os.path.basename(path)[: -len(".jsonl")], "v2", None)
+    for path in glob.glob(os.path.join(root, "*", "sess_*", "messages.jsonl")):
+        sid = os.path.basename(os.path.dirname(path))
+        out[path] = Source(path, sid, "v3", None)
+    for path in glob.glob(os.path.join(root, "*", "sess_*", "sub-executions", "*.jsonl")):
+        parent = os.path.basename(os.path.dirname(os.path.dirname(path)))
+        sid = os.path.basename(path)[: -len(".jsonl")]
+        out[path] = Source(path, sid, "v3-sub", parent)
+    return out
+
+
+def _iso_epoch(value):
+    """ISO-8601 timestamp to epoch SECONDS, the unit messages.ts uses for v2 too."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return int(datetime.datetime.fromisoformat(
+            value.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return None
+
+
+def _read_jsonl(path):
+    """Yield parsed records; count lines that are not JSON objects."""
+    bad = [0]
+
+    def gen():
+        with open(path, encoding="utf8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    bad[0] += 1
+                    continue
+                if isinstance(rec, dict):
+                    yield rec
+                else:
+                    bad[0] += 1
+    return gen(), bad
+
+
+def _load_json(path):
+    try:
+        with open(path, encoding="utf8", errors="replace") as f:
+            j = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return j if isinstance(j, dict) else None
+
+
+def _first_path(paths):
+    if isinstance(paths, list) and paths and isinstance(paths[0], str):
+        return paths[0]
+    return ""
 
 
 def _harden(path):
@@ -227,94 +331,244 @@ class Indexer:
             ),
         )
 
-    def index_file(self, path):
-        """Parse one .jsonl into the database. Assumes the session was dropped first."""
-        session_id = os.path.basename(path)[: -len(".jsonl")]
-        self.index_sidecar(session_id, path[: -len(".jsonl")] + ".json")
+    def index_file(self, path, source=None):
+        """Parse one source file into the database. Assumes the session was dropped first.
 
+        Without a source, the path is read as a v2 log, which is what it always was.
+        """
+        if source is None:
+            source = Source(path, os.path.basename(path)[: -len(".jsonl")], "v2", None)
+        if source.fmt == "v2":
+            self.index_sidecar(source.session_id, path[: -len(".jsonl")] + ".json")
+            parsed = self._parse_v2(path, source.session_id)
+        else:
+            parsed = self._parse_v3(source)
+        return self._store(path, source.session_id, *parsed)
+
+    def _parse_v2(self, path, session_id):
         msgs, fts, calls, results = [], [], [], []
         seq = 0
         last_ts = None
-        bad_lines = 0
+        records, bad = _read_jsonl(path)
 
-        with open(path, encoding="utf8", errors="replace") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    bad_lines += 1
-                    continue
-                kind = rec.get("kind")
-                data = rec.get("data")
-                if kind in SKIP_KINDS or not isinstance(data, dict):
-                    continue
+        for rec in records:
+            kind = rec.get("kind")
+            data = rec.get("data")
+            if kind in SKIP_KINDS or not isinstance(data, dict):
+                continue
 
-                meta = data.get("meta")
-                if isinstance(meta, dict) and meta.get("timestamp"):
-                    last_ts = meta["timestamp"]  # epoch SECONDS
-                message_id = data.get("message_id")
+            meta = data.get("meta")
+            if isinstance(meta, dict) and meta.get("timestamp"):
+                last_ts = meta["timestamp"]  # epoch SECONDS
+            message_id = data.get("message_id")
 
-                if kind == "Clear":
-                    seq += 1
-                    msgs.append((self.next_msg, session_id, message_id, 0, seq,
-                                 "Clear", None, "clear", None, last_ts))
-                    self.next_msg += 1
-                    continue
+            if kind == "Clear":
+                seq += 1
+                msgs.append((self.next_msg, session_id, message_id, 0, seq,
+                             "Clear", None, "clear", None, last_ts))
+                self.next_msg += 1
+                continue
 
-                if kind == "ToolResults":
-                    for tool_use_id, val in (data.get("results") or {}).items():
-                        if not isinstance(val, dict):
-                            continue
-                        name = _tool_name(val.get("tool"))
-                        if name in SKIP_TOOLS:
-                            continue
-                        payload = _leaf_text(val.get("result"))
-                        if not payload.strip():
-                            continue
-                        results.append((tool_use_id, session_id, message_id, name,
-                                        _result_status(val.get("result")), payload))
-                    continue
-
-                role = "user" if kind == "Prompt" else "assistant"
-                for idx, item in enumerate(data.get("content") or []):
-                    if not isinstance(item, dict):
+            if kind == "ToolResults":
+                for tool_use_id, val in (data.get("results") or {}).items():
+                    if not isinstance(val, dict):
                         continue
-                    ctype = item.get("kind")
-                    payload = item.get("data")
-                    body = None
-
-                    if ctype == "text" and isinstance(payload, str):
-                        body = payload
-                    elif ctype == "thinking" and isinstance(payload, dict):
-                        # .signature is a cryptographic blob: never indexed, never stored.
-                        body = payload.get("text")
-                    elif ctype == "toolUse" and isinstance(payload, dict):
-                        args = payload.get("input")
-                        args = args if isinstance(args, dict) else {}
-                        seq += 1
-                        calls.append((
-                            payload.get("toolUseId"), session_id, message_id, seq,
-                            payload.get("name"),
-                            args.get("__tool_use_purpose"),
-                            args.get("path") or args.get("file_path"),
-                            json.dumps(args, ensure_ascii=False),
-                        ))
-                        # Only the agent-written purpose is prose; file bodies in
-                        # newStr/oldStr/content stay in input_json, unindexed.
-                        body = args.get("__tool_use_purpose")
-
-                    if not body:
+                    name = _tool_name(val.get("tool"))
+                    if name in SKIP_TOOLS:
                         continue
-                    seq += 1
-                    mid = self.next_msg
-                    self.next_msg += 1
-                    msgs.append((mid, session_id, message_id, idx, seq, kind, role,
-                                 ctype, body, last_ts))
-                    fts.append((mid, T.split_index(body)))
+                    payload = _leaf_text(val.get("result"))
+                    if not payload.strip():
+                        continue
+                    results.append((tool_use_id, session_id, message_id, name,
+                                    _result_status(val.get("result")), payload))
+                continue
 
+            role = "user" if kind == "Prompt" else "assistant"
+            for idx, item in enumerate(data.get("content") or []):
+                if not isinstance(item, dict):
+                    continue
+                ctype = item.get("kind")
+                payload = item.get("data")
+                body = None
+
+                if ctype == "text" and isinstance(payload, str):
+                    body = payload
+                elif ctype == "thinking" and isinstance(payload, dict):
+                    # .signature is a cryptographic blob: never indexed, never stored.
+                    body = payload.get("text")
+                elif ctype == "toolUse" and isinstance(payload, dict):
+                    args = payload.get("input")
+                    args = args if isinstance(args, dict) else {}
+                    seq += 1
+                    calls.append((
+                        payload.get("toolUseId"), session_id, message_id, seq,
+                        payload.get("name"),
+                        args.get("__tool_use_purpose"),
+                        args.get("path") or args.get("file_path"),
+                        json.dumps(args, ensure_ascii=False),
+                    ))
+                    # Only the agent-written purpose is prose; file bodies in
+                    # newStr/oldStr/content stay in input_json, unindexed.
+                    body = args.get("__tool_use_purpose")
+
+                if not body:
+                    continue
+                seq += 1
+                mid = self.next_msg
+                self.next_msg += 1
+                msgs.append((mid, session_id, message_id, idx, seq, kind, role,
+                             ctype, body, last_ts))
+                fts.append((mid, T.split_index(body)))
+
+        return msgs, fts, calls, results, bad[0]
+
+    # ---------- v3 ----------
+
+    def _v3_session_row(self, source):
+        """Session metadata for a v3 session or sub-agent transcript.
+
+        A top-level session reads its session.json. A sub-agent transcript has no
+        sidecar: its metadata comes from the parent's sub_agent_start record and the
+        parent's session.json. Returns the opening prompt for a sub-agent, else None.
+        """
+        sess_dir = os.path.dirname(source.path)
+        if source.fmt == "v3-sub":
+            sess_dir = os.path.dirname(sess_dir)
+        j = _load_json(os.path.join(sess_dir, "session.json")) or {}
+        cwd = _first_path(j.get("workspacePaths")) or _first_path(j.get("rootPaths"))
+        row = {
+            "session_id": source.session_id, "cwd": cwd, "title": j.get("title"),
+            "created_at": j.get("createdAt"), "updated_at": j.get("lastModifiedAt"),
+            "created_reason": None, "parent_session_id": None,
+            "model": j.get("modelId"), "agent_name": j.get("agentMode"),
+        }
+        start = None
+        if source.fmt == "v3-sub":
+            row.update(created_reason="subagent", parent_session_id=source.parent,
+                       title=None, created_at=None, updated_at=None, agent_name=None)
+            parent_log = os.path.join(sess_dir, "messages.jsonl")
+            if os.path.exists(parent_log):
+                records, _ = _read_jsonl(parent_log)
+                for rec in records:
+                    p = rec.get("payload")
+                    if not isinstance(p, dict) or p.get("subSessionId") != source.session_id:
+                        continue
+                    if p.get("type") == "sub_agent_start":
+                        start = (rec.get("id"), rec.get("timestamp"), p)
+                        prompt = p.get("prompt") or ""
+                        row.update(
+                            agent_name=p.get("subAgentName"),
+                            title=p.get("explanation") or prompt.strip().split("\n")[0][:80] or None,
+                            created_at=rec.get("timestamp"))
+                    elif p.get("type") == "sub_agent_complete":
+                        row["updated_at"] = rec.get("timestamp")
+        self.con.execute(
+            "INSERT OR REPLACE INTO sessions(session_id, cwd, project, title, created_at,"
+            " updated_at, created_reason, parent_session_id, model, agent_name)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (row["session_id"], row["cwd"],
+             os.path.basename(row["cwd"].rstrip("/")) or None, row["title"],
+             row["created_at"], row["updated_at"], row["created_reason"],
+             row["parent_session_id"], row["model"], row["agent_name"]))
+        return start
+
+    def _parse_v3(self, source):
+        """Map v3 event records onto the v2 vocabulary.
+
+        user -> Prompt/text, assistant Say -> AssistantMessage/text, assistant
+        Reasoning -> AssistantMessage/thinking, tool_call -> toolUse purpose plus a
+        tool_calls row, tool_result -> tool_results. Every record carries its own id
+        and timestamp, so no carry-forward is needed. Records of other types (turn
+        boundaries, usage, injected context, consent prompts) are not prose and are
+        skipped. reasoningSignature is the v3 signature blob: never stored.
+        """
+        session_id = source.session_id
+        msgs, fts, calls, results = [], [], [], []
+        seq = 0
+        tool_names = {}
+
+        def add_msg(message_id, idx, kind, role, ctype, body, ts):
+            nonlocal seq
+            seq += 1
+            mid = self.next_msg
+            self.next_msg += 1
+            msgs.append((mid, session_id, message_id, idx, seq, kind, role,
+                         ctype, body, ts))
+            fts.append((mid, T.split_index(body)))
+
+        start = self._v3_session_row(source)
+        if start:
+            # The sub-agent's task, written by its parent: v2 logged it as the child's
+            # first user turn. Anchored on the child's own id, which no record reuses.
+            rid, ts, p = start
+            if p.get("prompt"):
+                add_msg(session_id, 0, "Prompt", "user", "text", p["prompt"],
+                        _iso_epoch(ts))
+
+        records, bad = _read_jsonl(source.path)
+        for rec in records:
+            p = rec.get("payload")
+            if not isinstance(p, dict):
+                continue
+            rtype = p.get("type")
+            message_id = rec.get("id")
+            ts = _iso_epoch(rec.get("timestamp"))
+
+            if rtype == "user":
+                if isinstance(p.get("content"), str) and p["content"]:
+                    add_msg(message_id, 0, "Prompt", "user", "text", p["content"], ts)
+            elif rtype == "assistant":
+                ctype = V3_ASSISTANT_TYPES.get(p.get("operationType"), "text")
+                if isinstance(p.get("content"), str) and p["content"]:
+                    add_msg(message_id, 0, "AssistantMessage", "assistant", ctype,
+                            p["content"], ts)
+            elif rtype == "tool_call":
+                args = p.get("args") if isinstance(p.get("args"), dict) else {}
+                tool_use_id = p.get("toolCallId")
+                name = p.get("toolName")
+                tool_names[tool_use_id] = name
+                purpose = next((args[k] for k in V3_PURPOSE_ARGS
+                                if isinstance(args.get(k), str) and args[k]), None)
+                seq += 1
+                calls.append((tool_use_id, session_id, message_id, seq, name, purpose,
+                              args.get("path") or args.get("file_path") or p.get("filePath"),
+                              json.dumps(args, ensure_ascii=False)))
+                if purpose:
+                    add_msg(message_id, 0, "AssistantMessage", "assistant", "toolUse",
+                            purpose, ts)
+            elif rtype == "tool_result":
+                tool_use_id = p.get("toolCallId")
+                name = tool_names.get(tool_use_id) or "Unknown"
+                if name in SKIP_TOOLS:
+                    continue
+                payload = _leaf_text(p.get("content"))
+                if not payload.strip():
+                    continue
+                status = {True: "success", False: "error"}.get(p.get("success"))
+                results.append((tool_use_id, session_id, message_id, name, status,
+                                payload))
+            elif rtype == "sub_agent_start":
+                # The delegation is this session's tool call; the child's transcript
+                # is indexed as its own session from sub-executions/.
+                args = {"subAgentName": p.get("subAgentName"), "prompt": p.get("prompt")}
+                seq += 1
+                calls.append((p.get("subSessionId"), session_id, message_id, seq,
+                              V3_SUBAGENT_TOOL, p.get("explanation"), None,
+                              json.dumps(args, ensure_ascii=False)))
+                tool_names[p.get("subSessionId")] = V3_SUBAGENT_TOOL
+                if p.get("explanation"):
+                    add_msg(message_id, 0, "AssistantMessage", "assistant", "toolUse",
+                            p["explanation"], ts)
+            elif rtype == "sub_agent_complete":
+                payload = p.get("response") if isinstance(p.get("response"), str) else ""
+                if payload.strip():
+                    status = "success" if p.get("status") == "success" else "error"
+                    results.append((p.get("subSessionId"), session_id, message_id,
+                                    V3_SUBAGENT_TOOL, status, payload))
+
+        return msgs, fts, calls, results, bad[0]
+
+    def _store(self, path, session_id, msgs, fts, calls, results, bad_lines):
         con = self.con
         con.executemany("INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?,?)", msgs)
         con.executemany("INSERT INTO messages_fts(rowid, search_text) VALUES(?,?)", fts)
@@ -339,11 +593,10 @@ class Indexer:
 
 def stale_files(con, sessions_dir=None):
     """Source files that are new or changed since they were indexed."""
-    sessions_dir = sessions_dir or _sessions_dir()
     known = {p: (m, s) for p, m, s in
              con.execute("SELECT path, mtime, size FROM files")}
     out = []
-    for path in sorted(glob.glob(os.path.join(sessions_dir, "*.jsonl"))):
+    for path in sorted(discover(sessions_dir)):
         try:
             st = os.stat(path)
         except OSError:
@@ -355,8 +608,7 @@ def stale_files(con, sessions_dir=None):
 
 
 def vanished_sessions(con, sessions_dir=None):
-    sessions_dir = sessions_dir or _sessions_dir()
-    present = set(glob.glob(os.path.join(sessions_dir, "*.jsonl")))
+    present = discover(sessions_dir)
     return [(p, s) for p, s in con.execute("SELECT path, session_id FROM files")
             if p not in present]
 
@@ -398,6 +650,7 @@ def update(db_path=None, sessions_dir=None, full=False, verbose=False):
     con = connect(db_path)
     try:
         idx = Indexer(con)
+        sources = discover(sessions_dir)
         targets = stale_files(con, sessions_dir)
         gone = vanished_sessions(con, sessions_dir)
 
@@ -407,7 +660,8 @@ def update(db_path=None, sessions_dir=None, full=False, verbose=False):
         totals = {"messages": 0, "tool_calls": 0, "tool_results": 0, "bad_lines": 0}
         failed = []
         for path in targets:
-            session_id = os.path.basename(path)[: -len(".jsonl")]
+            source = sources[path]
+            session_id = source.session_id
             # Each file is its own unit of work. A failure -- most likely the
             # ux_msg_citation constraint catching an insertion bug or genuinely
             # duplicated upstream ids -- must abort only this session, loudly, while
@@ -415,7 +669,7 @@ def update(db_path=None, sessions_dir=None, full=False, verbose=False):
             # query, which is a worse outcome than one missing session.
             try:
                 idx.drop_session(session_id)
-                stats = idx.index_file(path)
+                stats = idx.index_file(path, source)
                 con.commit()
             except (sqlite3.Error, ValueError, OSError) as exc:
                 con.rollback()

@@ -519,5 +519,189 @@ class TestMalformedInput(unittest.TestCase):
             con.close()
 
 
+class MixedCase(unittest.TestCase):
+    """A sessions root with v2 logs under cli/ and v3 sessions beside them."""
+
+    def setUp(self):
+        self.c = F.MixedCorpus(n_v2=2, n_v3=2)
+        self.c.__enter__()
+        self.stats = I.update(db_path=self.c.db, sessions_dir=self.c.root, full=True)
+        self.con = sqlite3.connect(self.c.db)
+
+    def tearDown(self):
+        self.con.close()
+        self.c.__exit__(None, None, None)
+
+    def one(self, sql, *p):
+        return self.con.execute(sql, p).fetchone()[0]
+
+    def v3_msgs(self, sid):
+        return self.con.execute(
+            "SELECT message_id, content_index, kind, role, content_type, text, ts"
+            " FROM messages WHERE session_id=? ORDER BY seq", (sid,)).fetchall()
+
+
+class TestV3Discovery(MixedCase):
+    def test_both_formats_are_indexed(self):
+        # 2 v2 logs, 2 v3 sessions, 1 v3 sub-agent transcript.
+        self.assertEqual(self.stats["files_indexed"], 5)
+        self.assertEqual(self.stats["files_failed"], 0)
+        self.assertEqual(self.one("SELECT count(*) FROM sessions"), 5)
+
+    def test_v2_root_without_cli_subdir_still_works(self):
+        self.assertEqual(I.v2_dir(os.path.join(self.c.root, "cli")),
+                         os.path.join(self.c.root, "cli"))
+        self.assertEqual(I.v2_dir(self.c.root), os.path.join(self.c.root, "cli"))
+
+    def test_session_ids(self):
+        sources = I.discover(self.c.root)
+        by_fmt = {}
+        for s in sources.values():
+            by_fmt.setdefault(s.fmt, set()).add(s.session_id)
+        self.assertEqual(by_fmt["v2"], set(self.c.v2_ids))
+        self.assertEqual(by_fmt["v3"], set(self.c.v3_ids))
+        self.assertEqual(by_fmt["v3-sub"], {F.V3_SUB_ID})
+
+    def test_search_spans_both_formats(self):
+        # The same sentence is in every v2 and every v3 session.
+        hits = self.con.execute(
+            "SELECT DISTINCT m.session_id FROM messages_fts f JOIN messages m"
+            " ON m.id=f.rowid WHERE messages_fts MATCH ?",
+            (T.build_match("遗忘机制"),)).fetchall()
+        self.assertEqual({h[0] for h in hits},
+                         set(self.c.v2_ids) | set(self.c.v3_ids))
+
+
+class TestV3Mapping(MixedCase):
+    def test_prose_maps_onto_v2_vocabulary(self):
+        sid = self.c.v3_ids[1]
+        rows = [(r[2], r[3], r[4], r[5]) for r in self.v3_msgs(sid)]
+        self.assertEqual(rows, [
+            ("Prompt", "user", "text", "请帮我看看遗忘机制的设计"),
+            ("AssistantMessage", "assistant", "thinking", "用户在问记忆系统"),
+            ("AssistantMessage", "assistant", "text", "好的，我先看 DatabaseSync 的实现"),
+            ("AssistantMessage", "assistant", "toolUse",
+             "Check the decay mechanism in memory code"),
+        ])
+
+    def test_citation_anchor_is_the_record_id(self):
+        sid = self.c.v3_ids[1]
+        self.assertEqual(self.v3_msgs(sid)[0][:2], (f"{sid}-u1", 0))
+
+    def test_timestamps_are_epoch_seconds(self):
+        import datetime
+        ts = self.v3_msgs(self.c.v3_ids[1])[0][6]
+        want = datetime.datetime(2026, 11, 7, 3, 18, 2, tzinfo=datetime.timezone.utc)
+        self.assertEqual(ts, int(want.timestamp()))
+
+    def test_non_prose_events_are_not_indexed(self):
+        dump = raw_dump(self.c.db)
+        for marker in ("V3_SYSTEM_PROMPT_MUST_NOT_BE_INDEXED",
+                       "V3_INJECTED_CONTEXT_MUST_NOT_BE_INDEXED"):
+            self.assertNotIn(marker, dump)
+
+    def test_reasoning_signature_never_stored(self):
+        self.assertNotIn(F.V3_SIG, raw_dump(self.c.db))
+
+    def test_read_file_output_skipped(self):
+        self.assertNotIn("V3_READ_FILE_PAYLOAD_MUST_BE_SKIPPED", raw_dump(self.c.db))
+
+    def test_file_bodies_stored_but_not_searchable(self):
+        self.assertEqual(fts_search(self.c.db, "V3_FILE_BODY_SHOULD_NOT_BE_SEARCHABLE"), 0)
+        self.assertIn("V3_FILE_BODY_SHOULD_NOT_BE_SEARCHABLE",
+                      self.one("SELECT input_json FROM tool_calls WHERE name='str_replace'"
+                               " AND session_id=?", self.c.v3_ids[1]))
+
+    def test_tool_call_and_failed_result(self):
+        sid = self.c.v3_ids[1]
+        name, purpose = self.con.execute(
+            "SELECT name, purpose FROM tool_calls WHERE tool_use_id=?",
+            (f"{sid}-t1",)).fetchone()
+        self.assertEqual((name, purpose),
+                         ("execute_bash", "Check the decay mechanism in memory code"))
+        self.assertEqual(self.con.execute(
+            "SELECT tool_name, status FROM tool_results WHERE tool_use_id=?",
+            (f"{sid}-t1",)).fetchone(), ("execute_bash", "error"))
+        self.assertEqual(self.one("SELECT path FROM tool_calls WHERE tool_use_id=?",
+                                  f"{sid}-t2"), "/etc/hosts")
+
+    def test_output_shared_across_formats_is_stored_once(self):
+        # DUPLICATE_OUTPUT is produced by every v2 and every v3 session.
+        self.assertEqual(self.one("SELECT count(*) FROM tool_output WHERE output=?",
+                                  F.DUPLICATE_OUTPUT), 1)
+
+    def test_session_metadata(self):
+        row = self.con.execute(
+            "SELECT cwd, project, title, created_at, model, agent_name,"
+            " parent_session_id FROM sessions WHERE session_id=?",
+            (self.c.v3_ids[1],)).fetchone()
+        self.assertEqual(row, ("/home/u/projects/v3proj1", "v3proj1", "v3 session 1",
+                               "2026-11-07T03:18:00.000Z", "test-model", "test-agent",
+                               None))
+
+
+class TestV3Subagent(MixedCase):
+    def test_lineage(self):
+        row = self.con.execute(
+            "SELECT parent_session_id, created_reason, agent_name, title, cwd,"
+            " created_at, updated_at FROM sessions WHERE session_id=?",
+            (F.V3_SUB_ID,)).fetchone()
+        self.assertEqual(row, (self.c.v3_ids[0], "subagent", "helper-agent",
+                               "Delegate the log fetch", "/home/u/projects/v3proj0",
+                               "2026-11-07T03:18:11.000Z", "2026-11-07T03:18:20.000Z"))
+
+    def test_task_prompt_is_the_child_first_user_turn(self):
+        first = self.v3_msgs(F.V3_SUB_ID)[0]
+        self.assertEqual(first[:5], (F.V3_SUB_ID, 0, "Prompt", "user", "text"))
+        self.assertIn("子代理的任务", first[5])
+
+    def test_child_transcript_indexed(self):
+        texts = [r[5] for r in self.v3_msgs(F.V3_SUB_ID)]
+        self.assertIn("子代理正在获取日志", texts)
+        self.assertIn("SUBAGENT_TOOL_OUTPUT", raw_dump(self.c.db))
+
+    def test_parent_records_the_delegation(self):
+        parent = self.c.v3_ids[0]
+        self.assertEqual(self.con.execute(
+            "SELECT session_id, name, purpose FROM tool_calls WHERE tool_use_id=?",
+            (F.V3_SUB_ID,)).fetchone(),
+            (parent, I.V3_SUBAGENT_TOOL, "Delegate the log fetch"))
+        self.assertEqual(self.one(
+            "SELECT o.output FROM tool_results r JOIN tool_output o ON o.id=r.output_id"
+            " WHERE r.tool_use_id=?", F.V3_SUB_ID), "SUBAGENT_RESPONSE build log saved")
+
+
+class TestV3Incremental(MixedCase):
+    def test_unchanged_is_a_no_op(self):
+        self.assertEqual(
+            I.update(db_path=self.c.db, sessions_dir=self.c.root)["files_indexed"], 0)
+
+    def test_appended_v3_session_is_picked_up(self):
+        self.c.append_v3(self.c.v3_ids[1], "三期新增 appended")
+        stats = I.update(db_path=self.c.db, sessions_dir=self.c.root)
+        self.assertEqual(stats["files_indexed"], 1)
+        self.assertGreater(fts_search(self.c.db, "三期新增"), 0)
+
+    def test_incremental_equals_full_rebuild(self):
+        self.c.append_v3(self.c.v3_ids[0], "增量与全量必须一致 equivalence")
+        I.update(db_path=self.c.db, sessions_dir=self.c.root)
+        incremental = snapshot(self.c.db)
+        I.update(db_path=self.c.db, sessions_dir=self.c.root, full=True)
+        self.assertEqual(incremental, snapshot(self.c.db))
+
+    def test_removed_v3_session_is_dropped(self):
+        import shutil
+        shutil.rmtree(os.path.dirname(self.c.v3_log(self.c.v3_ids[1])))
+        stats = I.update(db_path=self.c.db, sessions_dir=self.c.root)
+        self.assertEqual(stats["sessions_removed"], 1)
+        self.assertEqual(self.one("SELECT count(*) FROM sessions WHERE session_id=?",
+                                  self.c.v3_ids[1]), 0)
+
+    def test_source_is_never_modified(self):
+        before = {p: os.stat(p).st_mtime for p in I.discover(self.c.root)}
+        I.update(db_path=self.c.db, sessions_dir=self.c.root, full=True)
+        self.assertEqual(before, {p: os.stat(p).st_mtime for p in I.discover(self.c.root)})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
